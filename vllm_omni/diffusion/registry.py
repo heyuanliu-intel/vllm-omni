@@ -56,6 +56,11 @@ _DIFFUSION_MODELS = {
         "pipeline_ovis_image",
         "OvisImagePipeline",
     ),
+    "MiniMaxH3Pipeline": (
+        "minimax_h3",
+        "pipeline_minimax_h3",
+        "MiniMaxH3Pipeline",
+    ),
     "WanPipeline": (
         "wan2_2",
         "pipeline_wan2_2",
@@ -496,6 +501,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "ZImagePipeline": "get_post_process_func",
     "OvisImagePipeline": "get_ovis_image_post_process_func",
     "BooguImagePipeline": "get_boogu_image_post_process_func",
+    "MiniMaxH3Pipeline": "get_minimax_h3_post_process_func",
     "WanPipeline": "get_wan22_post_process_func",
     "WanVACEPipeline": "get_wan22_vace_post_process_func",
     "LTX2Pipeline": "get_ltx2_post_process_func",
