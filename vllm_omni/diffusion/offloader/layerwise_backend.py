@@ -14,6 +14,8 @@ from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
 from vllm_omni.platforms import current_omni_platform
 
 from .base import OffloadBackend, OffloadConfig
+from .residency import ResidencyCoordinator, TransientResidencyHook
+from .block_discovery import _resolve_blocks_attr
 from .module_collector import ModuleDiscovery
 
 logger = init_logger(__name__)
@@ -283,6 +285,7 @@ class LayerWiseOffloadBackend(OffloadBackend):
 
         self.copy_stream = current_omni_platform.Stream()
         self._blocks: list[list[nn.Module]] = []
+        self._residency: ResidencyCoordinator | None = None
 
     def enable(self, pipeline: nn.Module) -> None:
         if self.enabled:
@@ -290,20 +293,80 @@ class LayerWiseOffloadBackend(OffloadBackend):
             return
 
         modules = ModuleDiscovery.discover(pipeline)
-        if not modules.dits:
+        target_dit = self.config.targets_dit()
+        target_te = self.config.targets_text_encoder()
+
+        if target_dit and not modules.dits:
             logger.warning("No DiT/transformer modules found, skipping layer-wise offloading")
             return
+        if target_te and not modules.encoders:
+            logger.warning("No encoder modules found, cannot layer-wise offload 'text_encoder'")
 
-        # Move encoders to GPU (they stay resident)
-        for enc in modules.encoders:
-            enc.to(self.device)
+        logger.info(
+            "Layer-wise offload components=%s (dits=%s, encoders=%s)",
+            list(self.config.layerwise_components),
+            modules.dit_names,
+            modules.encoder_names,
+        )
 
-        # Move VAE(s) to GPU if available
+        # Components that are NOT layer-wise targets stay fully device-resident.
+        if not target_te:
+            for enc in modules.encoders:
+                enc.to(self.device)
+
+        # Components that are not layer-wise targets stay whole on the device, so
+        # they are what a VAE run has to displace. Layer-wise targets keep their
+        # weights on the host already and must not be moved by this hook.
+        vae_offload_targets: list[nn.Module] = []
+        if not target_dit:
+            vae_offload_targets.extend(modules.dits)
+        if not target_te:
+            vae_offload_targets.extend(modules.encoders)
+
+        # VAEs are device-resident by default. With vae_cpu_offload they are
+        # parked on the host and pulled back in by their own pre-forward hook.
+        # Layer-wise offloading previously ignored this flag entirely, which on
+        # MiniMax-H3 (VAE built on the device, in FP32) left the VAE's full
+        # footprint occupying the card throughout denoising.
+        offload_vaes = bool(getattr(self.config, "vae_cpu_offload", False))
+        # Explicit residency, not a hook net. The VAE declares a scope around its
+        # own forward: on entry the whole-resident components are evicted, on exit
+        # (in a finally, so a failed decode cannot poison the next request) the VAE
+        # is parked again and those components are restored whole -- parameters and
+        # buffers together, which is what H3's RoPE inv_freq needs. See residency.py
+        # for why the symmetric-hook variant was rejected.
+        # A layer-wise target is deliberately excluded from the evictee set: its
+        # weights already live on the host between blocks and its own block hooks
+        # own the transfers.
+        if offload_vaes:
+            self._residency = ResidencyCoordinator(
+                residents=vae_offload_targets,
+                device=self.device,
+                pin_memory=self.config.pin_cpu_memory,
+                use_hsdp=self.config.use_hsdp,
+            )
         for vae in modules.vaes:
             try:
-                vae.to(self.device, non_blocking=True)
+                vae.to(torch.device("cpu") if offload_vaes else self.device, non_blocking=not offload_vaes)
+                if offload_vaes:
+                    registry = HookRegistry.get_or_create(vae)
+                    registry.register_hook(
+                        TransientResidencyHook._HOOK_NAME,
+                        TransientResidencyHook(self._residency),
+                    )
             except Exception as exc:
-                logger.debug("Failed to move VAE to GPU: %s", exc)
+                logger.warning("Failed to place VAE: %s", exc)
+
+        if offload_vaes:
+            # Moving a module off the device returns its blocks to the caching
+            # allocator, not to the driver -- release the cache so the freed VAE
+            # memory is actually available for denoising.
+            current_omni_platform.empty_cache()
+            logger.info(
+                "Layer-wise offload: VAE(s) parked on host (vae_cpu_offload); "
+                "explicit residency scope over %d whole-resident component(s)",
+                len(vae_offload_targets),
+            )
 
         # Move resident modules to GPU (small modules needed every forward)
         for name, module in zip(modules.resident_names, modules.resident_modules):
@@ -312,91 +375,118 @@ class LayerWiseOffloadBackend(OffloadBackend):
             except Exception as exc:
                 logger.debug("Failed to move resident module %s to GPU: %s", name, exc)
 
-        logger.info("Applying layer-wise offloading on %s", modules.dit_names)
+        targets: list[tuple[str, nn.Module]] = []
+        if target_dit:
+            targets.extend(zip(modules.dit_names, modules.dits))
+        else:
+            for dit in modules.dits:
+                dit.to(self.device)
+        if target_te:
+            targets.extend(zip(modules.encoder_names, modules.encoders))
 
-        # Apply block-wise offloading hook for each of the blocks in DiT model(s)
-        # Note that there might exist multiple DiT models in specific pipelines
-        for i, dit_module in enumerate(modules.dits):
-            dit_name = modules.dit_names[i]
-            logger.info(f"Applying hooks on {dit_name} ({dit_module.__class__.__name__})")
+        for name, module in targets:
+            self._hook_module(name, module)
 
-            blocks_attr_names, blocks = LayerWiseOffloadBackend.get_blocks_from_dit(dit_module)
+        if len(self._blocks) > 0 and len(self._blocks[0]) > 0:
+            self.enabled = True
 
-            if not blocks:
-                logger.warning(
-                    "Target layers (blocks) not found. Skipping offloading on %s (%s)",
-                    dit_name,
-                    dit_module.__class__.__name__,
-                )
-                dit_module.to(self.device)
-                continue
+    def _hook_module(self, module_name: str, module: nn.Module) -> None:
+        """Apply the sliding-window block hooks to one component.
 
-            num_blocks = len(blocks)
-            if num_blocks <= 1:
-                logger.warning(
-                    "#Target layers (blocks) <= 1. Skipping offloading on %s (%s)",
-                    dit_name,
-                    dit_module.__class__.__name__,
-                )
-                dit_module.to(self.device)
-                continue
+        Falls back to making the whole component device-resident when its blocks
+        cannot be discovered, so a component without a block list never silently
+        stays on the host.
+        """
+        logger.info(f"Applying hooks on {module_name} ({module.__class__.__name__})")
 
+        blocks_attr_names, blocks = LayerWiseOffloadBackend.get_blocks_from_dit(module)
+
+        if not blocks:
+            logger.warning(
+                "Target layers (blocks) not found. Skipping offloading on %s (%s)",
+                module_name,
+                module.__class__.__name__,
+            )
+            module.to(self.device)
+            return
+
+        num_blocks = len(blocks)
+        if num_blocks <= 1:
+            logger.warning(
+                "#Target layers (blocks) <= 1. Skipping offloading on %s (%s)",
+                module_name,
+                module.__class__.__name__,
+            )
+            module.to(self.device)
+            return
+
+        if any("." in n for n in blocks_attr_names):
+            # Blocks live below the component root (e.g. the text encoder's
+            # ``text_model.layers``). Move every tensor that is not owned by a
+            # block to the device; the hooks stream the blocks themselves.
+            block_tensor_ids = {
+                id(t) for b in blocks for t in chain(b.parameters(recurse=True), b.buffers(recurse=True))
+            }
+            for param in module.parameters(recurse=True):
+                if id(param) not in block_tensor_ids:
+                    param.data = param.data.to(self.device, non_blocking=True)
+            for buffer in module.buffers(recurse=True):
+                if id(buffer) not in block_tensor_ids:
+                    buffer.data = buffer.data.to(self.device, non_blocking=True)
+        else:
             # Move non-block modules to GPU (they stay resident)
-            for name, m in dit_module.named_children():
+            for name, m in module.named_children():
                 if name not in blocks_attr_names:
                     m.to(self.device)
                     logger.debug(f"Moved {name} to device {self.device}")
                 else:
                     logger.debug(f"Skipped blocks module {name}")
 
-            # Move top-level params/buffers to GPU (dit_module's own, not sub-modules)
-            for param in dit_module._parameters.values():
+            # Move top-level params/buffers to GPU (module's own, not sub-modules)
+            for param in module._parameters.values():
                 if param is not None:
                     param.data = param.data.to(self.device, non_blocking=True)
 
-            for buffer in dit_module._buffers.values():
+            for buffer in module._buffers.values():
                 if buffer is not None:
                     buffer.data = buffer.data.to(self.device, non_blocking=True)
 
-            # Pre-fetch the first layer by manually calling the hook function on the last layer;
-            # For subsequent requests, the first layer/block will be pre-fetched
-            # during the last layer compute of the previous request.
-            last_block, first_block = blocks[-1], blocks[0]
-            last_hook = apply_block_hook(
-                last_block,
-                first_block,
+        # Pre-fetch the first layer by manually calling the hook function on the last layer;
+        # For subsequent requests, the first layer/block will be pre-fetched
+        # during the last layer compute of the previous request.
+        last_block, first_block = blocks[-1], blocks[0]
+        last_hook = apply_block_hook(
+            last_block,
+            first_block,
+            self.device,
+            self.copy_stream,
+            self.config.pin_cpu_memory,
+        )
+        last_hook.prefetch_layer(non_blocking=False)
+
+        block_hooks: list[LayerwiseOffloadHook] = [last_hook]
+        # Register hook for each of blocks
+        for i, block in enumerate(blocks[:-1]):
+            next_block = blocks[(i + 1) % num_blocks]
+            hook = apply_block_hook(
+                block,
+                next_block,
                 self.device,
                 self.copy_stream,
                 self.config.pin_cpu_memory,
             )
-            last_hook.prefetch_layer(non_blocking=False)
+            block_hooks.append(hook)
 
-            block_hooks: list[LayerwiseOffloadHook] = [last_hook]
-            # Register hook for each of blocks
-            for i, block in enumerate(blocks[:-1]):
-                next_block = blocks[(i + 1) % num_blocks]
-                hook = apply_block_hook(
-                    block,
-                    next_block,
-                    self.device,
-                    self.copy_stream,
-                    self.config.pin_cpu_memory,
-                )
-                block_hooks.append(hook)
+        # NOTE(yuanheng-zhao): We make each hook gets a backward reference to the hook
+        # that is responsible for prefetching its block's weights. This is specifically a
+        # workaround for that arbitrary blocks are skipped by caching systems (e.g., cache-dit)
+        for i in range(len(block_hooks)):
+            block_hooks[i]._prev_hook = block_hooks[i - 1]
 
-            # NOTE(yuanheng-zhao): We make each hook gets a backward reference to the hook
-            # that is responsible for prefetching its block's weights. This is specifically a
-            # workaround for that arbitrary blocks are skipped by caching systems (e.g., cache-dit)
-            for i in range(len(block_hooks)):
-                block_hooks[i]._prev_hook = block_hooks[i - 1]
+        logger.info(f"Layer-wise offloading enabled on {module_name}: {num_blocks} layers (blocks)")
 
-            logger.info(f"Layer-wise offloading enabled on {num_blocks} layers (blocks)")
-
-            # Track hooked blocks for cleanup
-            self._blocks.append(blocks)
-
-        if len(self._blocks) > 0 and len(self._blocks[0]) > 0:
-            self.enabled = True
+        # Track hooked blocks for cleanup
+        self._blocks.append(blocks)
 
     def disable(self) -> None:
         if not self.enabled:
@@ -407,6 +497,7 @@ class LayerWiseOffloadBackend(OffloadBackend):
                 remove_block_hook(block)
 
         self._blocks.clear()
+        self._residency = None
         self.enabled = False
         logger.info("Layer-wise offloading disabled")
 
@@ -456,7 +547,7 @@ class LayerWiseOffloadBackend(OffloadBackend):
 
         blocks = []
         for name in blocks_attr_names:
-            attr = getattr(model, name, None)
+            attr = _resolve_blocks_attr(model, name)
             if attr is None:
                 raise AttributeError(
                     f"Attribute '{name}' declared in _layerwise_offload_blocks_attrs "

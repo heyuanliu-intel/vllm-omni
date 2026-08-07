@@ -13,6 +13,22 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
+def _resolve_blocks_attr(model: nn.Module, name: str):
+    """Resolve a (possibly dotted) block-list attribute path on *model*.
+
+    Dotted paths let a component declare blocks that live below its root, e.g.
+    a text encoder whose decoder layers sit at ``text_model.layers``. Returns
+    ``None`` when any path segment is missing, which also covers ranks that
+    build a parameter-free stub instead of the real submodule.
+    """
+    obj = model
+    for part in name.split("."):
+        obj = getattr(obj, part, None)
+        if obj is None:
+            return None
+    return obj
+
+
 def get_blocks_attr_names(model: nn.Module) -> list[str]:
     """Get block attribute names from model class."""
     attrs: list[str] = getattr(model.__class__, "_layerwise_offload_blocks_attrs", [])
@@ -47,7 +63,7 @@ def get_blocks_from_dit(model: nn.Module) -> tuple[list[str], list[nn.Module]]:
 
     blocks: list[nn.Module] = []
     for name in blocks_attr_names:
-        attr = getattr(model, name, None)
+        attr = _resolve_blocks_attr(model, name)
         if attr is None:
             raise AttributeError(
                 f"Attribute '{name}' declared in _layerwise_offload_blocks_attrs "
