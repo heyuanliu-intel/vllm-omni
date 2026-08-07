@@ -192,6 +192,16 @@ class DiffusionParallelConfig:
     vae_patch_parallel_size: int = 1
     """Number of ranks used for VAE patch/tile parallelism (decode/encode)."""
 
+    text_encoder_tp_size: int = 1
+    """Number of ranks used to tensor-parallel shard the diffusion text encoder.
+
+    Ranks are the first ``text_encoder_tp_size`` DiT ranks.  Defaults to 1,
+    which keeps the encoder fully resident on the DiT main rank (historical
+    behavior).  Values > 1 shard the Qwen3-VL encoder across the encoder TP
+    ranks and run the encode with distributed collectives over the encoder
+    process group.
+    """
+
     vae_parallel_mode: str = "tile"
     """VAE parallel decode strategy.
 
@@ -674,6 +684,10 @@ class OmniDiffusionConfig:
     enable_cpu_offload: bool = False
     # Layer-wise offloading (block-level offloading) parameters
     enable_layerwise_offload: bool = False
+    # Which pipeline components layer-wise offloading targets. Comma-separated
+    # subset of {dit, text_encoder}. Components not listed stay device-resident.
+    # Historically layer-wise offload was hard-wired to the DiT only.
+    layerwise_offload_components: str = "dit"
     # Distributed layer-wise offloading with H2D + AllGather overlap (RFC-1)
     enable_distributed_layerwise_offload: bool = False
     # If True: shard weights 1/dp_size + AllGather (saves CPU memory, requires
@@ -686,6 +700,10 @@ class OmniDiffusionConfig:
     # VAE memory optimization parameters
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
+    # Park VAE weights on the host between uses instead of keeping them
+    # device-resident. Frees the VAE's footprint for denoising activations
+    # at the cost of one H2D transfer per encode/decode.
+    vae_cpu_offload: bool = False
 
     # STA (Sliding Tile Attention) parameters
     mask_strategy_file_path: str | None = None

@@ -637,6 +637,24 @@ class OmniServeCommand(CLISubcommand):
             help="Enable CPU offloading for diffusion models.",
         )
         omni_config_group.add_argument(
+            "--vae-cpu-offload",
+            action="store_true",
+            help="Keep VAE weights on the host between uses and move them to the "
+            "device only for encode/decode. Frees the VAE footprint for denoising "
+            "activations on memory-constrained devices. Equivalent to setting "
+            "OmniDiffusionConfig.vae_cpu_offload.",
+        )
+        omni_config_group.add_argument(
+            "--layerwise-offload-components",
+            type=str,
+            default="dit",
+            help="Comma-separated pipeline components that --enable-layerwise-offload "
+            "targets. Supported: 'dit', 'text_encoder'. Components not listed stay "
+            "device-resident. Defaults to 'dit', which reproduces the historical "
+            "DiT-only behaviour. Equivalent to setting "
+            "OmniDiffusionConfig.layerwise_offload_components.",
+        )
+        omni_config_group.add_argument(
             "--enable-layerwise-offload",
             action="store_true",
             help="Enable layerwise (blockwise) offloading on DiT modules.",
@@ -712,6 +730,15 @@ class OmniServeCommand(CLISubcommand):
             help="VAE Patch Parallelism degree for diffusion models. "
             "Distributes VAE decode workload across multiple ranks by splitting the latent spatially. "
             "Equivalent to setting DiffusionParallelConfig.vae_patch_parallel_size.",
+        )
+        omni_config_group.add_argument(
+            "--text-encoder-tp-size",
+            type=int,
+            default=1,
+            help="Tensor-parallel degree for the diffusion text encoder. "
+            "Shards the Qwen3-VL encoder across the first N DiT ranks, "
+            "removing the rank-0 encoder memory hotspot in no-offload runs. "
+            "Equivalent to setting DiffusionParallelConfig.text_encoder_tp_size.",
         )
         omni_config_group.add_argument(
             "--vae-parallel-mode",

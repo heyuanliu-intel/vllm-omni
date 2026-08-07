@@ -113,6 +113,7 @@ class _ParallelConfigEngineOverrides(TypedDict, total=False):
     ulysses_mode: str
     cfg_parallel_size: int
     vae_patch_parallel_size: int
+    text_encoder_tp_size: int
     use_hsdp: bool
     mask_sp_padding: bool
     hsdp_shard_size: int
@@ -370,6 +371,7 @@ class OmniStageDiffusionParallelConfig(OmniStageParallelConfig):
     ulysses_mode: str = "strict"
     cfg_parallel_size: int = Field(default=1, ge=1)
     vae_patch_parallel_size: int = Field(default=1, ge=1)
+    text_encoder_tp_size: int = Field(default=1, ge=1)
     vae_parallel_mode: str = "tile"
     use_hsdp: bool = False
     mask_sp_padding: bool = False
@@ -475,6 +477,8 @@ class _DiffusionConfigProjection:
     enable_cpu_offload: bool = False
     enable_layerwise_offload: bool = False
     enable_distributed_layerwise_offload: bool = False
+    layerwise_offload_components: str = "dit"
+    vae_cpu_offload: bool = False
     dlo_use_allgather: bool = True
     pin_cpu_memory: bool = True
     diffusion_compile_granularity: Literal["regional", "full"] = "regional"

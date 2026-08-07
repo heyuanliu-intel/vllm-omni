@@ -481,6 +481,8 @@ class OrchestratorArgs:
     enable_cpu_offload: bool = False
     enable_layerwise_offload: bool = False
     enable_distributed_layerwise_offload: bool = False
+    layerwise_offload_components: str = "dit"
+    vae_cpu_offload: bool = False
     dlo_use_allgather: bool = True
     boundary_ratio: float | None = None
     flow_shift: float | None = None
@@ -490,6 +492,7 @@ class OrchestratorArgs:
     cfg_parallel_size: int = 1
     vae_patch_parallel_size: int = 1
     vae_parallel_mode: str = "tile"
+    text_encoder_tp_size: int = 1
     default_sampling_params: str | None = None
     max_generated_image_size: int | None = None
     tts_max_instructions_length: int | None = None

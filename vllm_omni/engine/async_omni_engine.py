@@ -960,6 +960,7 @@ class AsyncOmniEngine:
             pipeline_parallel_size = normalized_kwargs.get("pipeline_parallel_size") or 1
             vae_patch_parallel_size = normalized_kwargs.get("vae_patch_parallel_size") or 1
             vae_parallel_mode = normalized_kwargs.get("vae_parallel_mode") or "tile"
+            text_encoder_tp_size = normalized_kwargs.get("text_encoder_tp_size") or 1
             enable_expert_parallel = normalized_kwargs.get("enable_expert_parallel") or False
             use_hsdp = normalized_kwargs.get("use_hsdp", False)
             hsdp_shard_size = normalized_kwargs.get("hsdp_shard_size", -1)
@@ -980,6 +981,7 @@ class AsyncOmniEngine:
                 cfg_parallel_size=cfg_parallel_size,
                 vae_patch_parallel_size=vae_patch_parallel_size,
                 vae_parallel_mode=vae_parallel_mode,
+                text_encoder_tp_size=text_encoder_tp_size,
                 use_hsdp=use_hsdp,
                 hsdp_shard_size=hsdp_shard_size,
                 hsdp_replicate_size=hsdp_replicate_size,
@@ -1014,7 +1016,9 @@ class AsyncOmniEngine:
             "cache_config": cache_config,
             "enable_cache_dit_summary": kwargs.get("enable_cache_dit_summary", False),
             "enable_cpu_offload": kwargs.get("enable_cpu_offload", False),
+            "vae_cpu_offload": kwargs.get("vae_cpu_offload", False),
             "enable_layerwise_offload": kwargs.get("enable_layerwise_offload", False),
+            "layerwise_offload_components": kwargs.get("layerwise_offload_components", "dit") or "dit",
             "enable_distributed_layerwise_offload": kwargs.get("enable_distributed_layerwise_offload", False),
             "dlo_use_allgather": kwargs.get("dlo_use_allgather", True),
             "enforce_eager": False if kwargs.get("enforce_eager") is None else kwargs.get("enforce_eager"),

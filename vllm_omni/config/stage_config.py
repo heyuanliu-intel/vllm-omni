@@ -377,6 +377,7 @@ class StageDeployConfig:
     cfg_parallel_size: int | None = None
     vae_patch_parallel_size: int | None = None
     vae_parallel_mode: str | None = None
+    text_encoder_tp_size: int | None = None
     use_hsdp: bool | None = None
     hsdp_shard_size: int | None = None
     hsdp_replicate_size: int | None = None
@@ -411,6 +412,8 @@ class StageDeployConfig:
     num_weight_load_threads: int | None = None
     enable_cpu_offload: bool | None = None
     enable_layerwise_offload: bool | None = None
+    layerwise_offload_components: str | None = None
+    vae_cpu_offload: bool | None = None
 
     # Diffusion-specific debug and observability knobs.
     enable_diffusion_pipeline_profiler: bool | None = None
