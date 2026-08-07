@@ -136,10 +136,9 @@ class OmniOpenAIServingVideo:
         provided_fields = request.model_fields_set
         fps_provided = self._request_fps_provided(request)
         vp = request.resolve_video_params()
-        if input_image is not None and vp.width is not None and vp.height is not None:
-            target_size = (vp.width, vp.height)
-            if input_image.size != target_size:
-                input_image = input_image.resize(target_size, Image.Resampling.LANCZOS)
+        # Geometry policy (AR check, letterbox/crop, final resize) belongs to the
+        # model pipeline, which sees the ORIGINAL image. A serving-layer stretch
+        # here silently distorts AR-mismatched references (squash root cause).
         multi_modal_data: dict[str, Any] = {}
         if input_image is not None:
             multi_modal_data["image"] = input_image
