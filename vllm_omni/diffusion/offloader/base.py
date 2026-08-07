@@ -28,7 +28,19 @@ class OffloadConfig:
     use_hsdp: bool = False
     dp_size: int = 1  # derived from parallel_config, not user-configurable
     dlo_use_allgather: bool = True  # if True: shard + AllGather; if False: full weights H2D only
+    vae_cpu_offload: bool = False  # park VAE weights on the host between encode/decode
     model_path: str | None = None  # checkpoint path for mmap weight loading
+    # Which components layer-wise offloading targets. Subset of {"dit", "text_encoder"}.
+    # Components absent from this set stay device-resident.
+    layerwise_components: tuple[str, ...] = ("dit",)
+
+    SUPPORTED_LAYERWISE_COMPONENTS = ("dit", "text_encoder")
+
+    def targets_dit(self) -> bool:
+        return "dit" in self.layerwise_components
+
+    def targets_text_encoder(self) -> bool:
+        return "text_encoder" in self.layerwise_components
 
     @classmethod
     def from_od_config(cls, od_config: OmniDiffusionConfig) -> "OffloadConfig":
@@ -52,6 +64,7 @@ class OffloadConfig:
         enable_layerwise_offload = getattr(od_config, "enable_layerwise_offload", False)
         enable_distributed_layerwise_offload = getattr(od_config, "enable_distributed_layerwise_offload", False)
         pin_cpu_memory = getattr(od_config, "pin_cpu_memory", True)
+        vae_cpu_offload = getattr(od_config, "vae_cpu_offload", False)
 
         parallel_config = getattr(od_config, "parallel_config", None)
         use_hsdp = getattr(parallel_config, "use_hsdp", False) if parallel_config else False
@@ -118,12 +131,32 @@ class OffloadConfig:
                 "rank) or disable HSDP."
             )
 
+        raw_components = getattr(od_config, "layerwise_offload_components", None) or "dit"
+        components: tuple[str, ...] = tuple(
+            dict.fromkeys(c.strip().lower() for c in str(raw_components).split(",") if c.strip())
+        ) or ("dit",)
+        unknown = [c for c in components if c not in cls.SUPPORTED_LAYERWISE_COMPONENTS]
+        if unknown:
+            raise ValueError(
+                f"Unknown layerwise offload component(s): {unknown}. "
+                f"Supported: {list(cls.SUPPORTED_LAYERWISE_COMPONENTS)}"
+            )
+        if components != ("dit",) and strategy is not OffloadStrategy.LAYER_WISE:
+            logger.warning(
+                "layerwise_offload_components=%s is only honoured by the layer-wise "
+                "strategy; current strategy is %s and will ignore it.",
+                components,
+                strategy.value,
+            )
+
         return cls(
             strategy=strategy,
+            layerwise_components=components,
             pin_cpu_memory=pin_cpu_memory,
             use_hsdp=use_hsdp,
             dp_size=dp_size,
             dlo_use_allgather=dlo_use_allgather,
+            vae_cpu_offload=vae_cpu_offload,
             model_path=getattr(od_config, "model", None),
         )
 

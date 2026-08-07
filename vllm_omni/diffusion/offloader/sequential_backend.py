@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 import torch
 from torch import nn
 from torch.distributed._tensor import DTensor  # type: ignore[attr-defined]
@@ -86,7 +87,21 @@ class SequentialOffloadHook(ModelHook):
             non_blocking=non_blocking,
             pin_memory=self.pin_memory,
         )
-        current_omni_platform.empty_cache()
+        # empty_cache() hands cached blocks back to the driver. Per the note
+        # above, the XPU allocator does not honour stream dependencies here,
+        # so any buffer still being written by an in-flight kernel -- the DiT
+        # latents this hook is about to hand to the VAE, above all -- can be
+        # released and reissued underneath that kernel. pre_forward() only
+        # synchronizes after the whole evict-then-load sequence, which is too
+        # late. EC_MODE selects the arm; see patch_empty_cache_order.py.
+        _ec_mode = os.environ.get("EC_MODE", "upstream").strip().lower()
+        if _ec_mode == "sync":
+            current_omni_platform.synchronize()
+            current_omni_platform.empty_cache()
+        elif _ec_mode == "none":
+            pass
+        else:
+            current_omni_platform.empty_cache()
 
     def _to_gpu(self, module: nn.Module) -> None:
         try:
@@ -123,6 +138,7 @@ def apply_sequential_offload(
     device: torch.device,
     pin_memory: bool = True,
     use_hsdp: bool = False,
+    vae_modules: list[nn.Module] | None = None,
 ) -> None:
     """Apply sequential offloading hooks to DiT and encoder modules.
 
@@ -145,12 +161,14 @@ def apply_sequential_offload(
         ... )
         >>> # Modules of pipeline now automatically swap between CPU and GPU
     """
+    vaes = list(vae_modules or [])
+
     # Register hooks on DiT modules (offload encoders AND other DiTs when a DiT runs)
     for i, dit_mod in enumerate(dit_modules):
         other_dits = [d for j, d in enumerate(dit_modules) if j != i]
         registry = HookRegistry.get_or_create(dit_mod)
         hook = SequentialOffloadHook(
-            offload_targets=encoder_modules + other_dits,
+            offload_targets=encoder_modules + other_dits + vaes,
             device=device,
             pin_memory=pin_memory,
             use_hsdp=use_hsdp,
@@ -162,13 +180,27 @@ def apply_sequential_offload(
     for enc in encoder_modules:
         registry = HookRegistry.get_or_create(enc)
         hook = SequentialOffloadHook(
-            offload_targets=dit_modules,
+            offload_targets=dit_modules + vaes,
             device=device,
             pin_memory=pin_memory,
             use_hsdp=use_hsdp,
         )
         registry.register_hook(SequentialOffloadHook._HOOK_NAME, hook)
         logger.debug("Registered offload hook for %s", enc.__class__.__name__)
+
+    # Register hooks on VAEs (offload DiTs and encoders when a VAE runs).
+    # Only populated when vae_cpu_offload is set; otherwise VAEs stay
+    # device-resident as SupportsComponentDiscovery documents.
+    for vae in vaes:
+        registry = HookRegistry.get_or_create(vae)
+        hook = SequentialOffloadHook(
+            offload_targets=dit_modules + encoder_modules,
+            device=device,
+            pin_memory=pin_memory,
+            use_hsdp=use_hsdp,
+        )
+        registry.register_hook(SequentialOffloadHook._HOOK_NAME, hook)
+        logger.debug("Registered offload hook for VAE %s", vae.__class__.__name__)
 
 
 def remove_sequential_offload(modules: list[nn.Module]) -> None:
@@ -232,12 +264,29 @@ class ModelLevelOffloadBackend(OffloadBackend):
         for enc in modules.encoders:
             enc.to(self.device)
 
-        # Move VAE(s) to GPU if available
+        # VAEs are device-resident by default. With vae_cpu_offload they are
+        # parked on the host instead -- note the explicit move to CPU: a
+        # pipeline may already have built its VAE on the device (MiniMax-H3
+        # does, in FP32), so not-moving-to-GPU is not enough to free it.
+        offload_vaes = bool(getattr(self.config, "vae_cpu_offload", False))
         for vae in modules.vaes:
             try:
-                vae.to(self.device, non_blocking=True)
+                vae.to(torch.device("cpu") if offload_vaes else self.device, non_blocking=not offload_vaes)
             except Exception as exc:
-                logger.debug("Failed to move VAE to GPU: %s", exc)
+                # A swallowed failure here is indistinguishable from a successful
+                # offload: both leave the VAE where it was and print nothing at
+                # INFO. Warn, so the next reader is not left measuring memory to
+                # find out whether the move happened.
+                logger.warning("Failed to place VAE: %s", exc)
+
+        if offload_vaes:
+            # Moving a module off the device returns its blocks to the caching
+            # allocator, not to the driver -- so xpu-smi keeps reporting the old
+            # figure and the offload looks like a no-op. Release the cache so the
+            # freed VAE memory is actually available to the DiT.
+            empty_cache = getattr(getattr(torch, self.device.type, None), "empty_cache", None)
+            if empty_cache is not None:
+                empty_cache()
 
         # Pin resident modules on GPU (small hot submodules called inside the DiT loop).
         for res, name in zip(modules.resident_modules, modules.resident_names):
@@ -264,10 +313,13 @@ class ModelLevelOffloadBackend(OffloadBackend):
             device=self.device,
             pin_memory=self.config.pin_cpu_memory,
             use_hsdp=self.config.use_hsdp,
+            vae_modules=modules.vaes if offload_vaes else None,
         )
 
         # Track modules for cleanup
         self._offload_modules = [*modules.dits, *modules.encoders]
+        if offload_vaes:
+            self._offload_modules.extend(modules.vaes)
 
         self.enabled = True
 
