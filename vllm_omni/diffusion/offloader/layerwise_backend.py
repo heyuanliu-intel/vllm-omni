@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from __future__ import annotations
 
 from itertools import chain
@@ -15,6 +15,7 @@ from vllm_omni.platforms import current_omni_platform
 
 from .base import OffloadBackend, OffloadConfig
 from .module_collector import ModuleDiscovery
+from .offload_plan import OffloadPlan, get_offload_plan
 
 logger = init_logger(__name__)
 
@@ -203,6 +204,44 @@ class LayerwiseOffloadHook(ModelHook):
 
         return True
 
+    def restore_next_block_to_host(self) -> None:
+        """Give the next block its weights back as ordinary CPU tensors.
+
+        Used when tearing the hook down. :meth:`prefetch_layer` cannot serve
+        this purpose: it allocates the block on ``self.device``, so restoring a
+        whole stack that way would put every block on the accelerator at once --
+        the exact residency layer-wise offloading exists to avoid. Rebuilding on
+        the host keeps teardown bounded and leaves the module usable.
+
+        The slices are cloned so each block owns its storage; the pinned master
+        buffer dies with the hook.
+
+        The physical layout is rebuilt with :func:`torch.as_strided` and the
+        recorded ``stride``, exactly as :meth:`prefetch_layer` does. ``.view()``
+        would reinterpret the flat staging slice in contiguous order, which is
+        wrong for any weight that was staged non-contiguously -- Cutlass FP8
+        weights are stored transposed, and ``_to_cpu`` deliberately preserved
+        that layout when it wrote the slice.
+        """
+        for dtype, ordered_metadata in self.dtype_metadata.items():
+            cpu_weight = self.dtype_cpu_flattened_weights[dtype]
+            for metadata in ordered_metadata:
+                name = metadata["name"]
+                target = (
+                    self.next_block_parameters[name]
+                    if name in self.next_block_parameters
+                    else self.next_block_buffers[name]
+                )
+                offset, numel = metadata["offset"], metadata["numel"]
+                LayerwiseOffloadHook._set_tensor_storage(
+                    target,
+                    torch.as_strided(
+                        cpu_weight[offset : offset + numel],
+                        size=metadata["shape"],
+                        stride=metadata["stride"],
+                    ).clone(),
+                )
+
     @torch.compiler.disable
     def prefetch_layer(self, non_blocking: bool = True) -> None:
         """Copy layer weights from CPU -> GPU.
@@ -295,6 +334,100 @@ def apply_block_hook(
     return hook
 
 
+def stream_declared_encoder_blocks(
+    module: nn.Module,
+    name: str,
+    plan: OffloadPlan | None,
+    device: torch.device,
+    *,
+    pin_memory: bool = True,
+) -> bool:
+    """Stream a plan-declared encoder's block stacks instead of pinning it whole.
+
+    An encoder that declares ``OffloadPlan.encoder_block_attrs`` is telling the
+    offloader which of its submodules are block lists that can be paged one at a
+    time. Without that, the only option is to keep the whole encoder resident,
+    which for a large vision-language encoder is most of the memory layer-wise
+    offloading is meant to free.
+
+    Returns whether streaming was installed; ``False`` means the caller should
+    fall back to keeping the encoder resident.
+    """
+    if plan is None or name not in plan.encoder_block_attrs:
+        return False
+    if getattr(module, "_omni_layerwise_enabled", False):
+        return True
+
+    from operator import attrgetter
+
+    hooks: list[LayerwiseOffloadHook] = []
+    block_groups: list[nn.ModuleList] = []
+    copy_stream = current_omni_platform.Stream()
+    for block_path in plan.encoder_block_attrs[name]:
+        try:
+            blocks = attrgetter(block_path)(module)
+        except AttributeError:
+            logger.warning("Encoder offload path %s.%s was not found", name, block_path)
+            continue
+        if not isinstance(blocks, nn.ModuleList) or len(blocks) <= 1:
+            logger.warning("Encoder offload path %s.%s is not a streamable block list", name, block_path)
+            continue
+        group_hooks = [apply_block_hook(blocks[-1], blocks[0], device, copy_stream, pin_memory)]
+        group_hooks.extend(
+            apply_block_hook(block, blocks[index + 1], device, copy_stream, pin_memory)
+            for index, block in enumerate(blocks[:-1])
+        )
+        for index, hook in enumerate(group_hooks):
+            hook._prev_hook = group_hooks[index - 1]
+        hooks.extend(group_hooks)
+        block_groups.append(blocks)
+
+    if not hooks:
+        return False
+    # The component lifecycle uses these generic attributes to keep only
+    # non-block encoder state resident during the encode phase.
+    module._omni_layerwise_hooks = hooks
+    module._omni_layerwise_block_groups = block_groups
+    module._omni_layerwise_enabled = True
+    logger.info(
+        "Enabled rank-local layerwise offload for encoder %s (%d blocks across %d stacks)",
+        name,
+        sum(len(blocks) for blocks in block_groups),
+        len(block_groups),
+    )
+    return True
+
+
+def teardown_streamed_encoder_blocks(module: nn.Module) -> None:
+    """Undo :func:`stream_declared_encoder_blocks` on one encoder.
+
+    Removing the hooks is not enough on its own: installing them replaced every
+    block parameter with an empty placeholder and moved the real weights into
+    the hook's pinned CPU copy, so dropping the hooks without materializing
+    first would leave the encoder unusable. Each hook owns the CPU copy of the
+    *next* block in the ring, so walking every hook restores the whole stack.
+
+    Restoration goes to host memory, not to the device: bringing every block
+    back onto the accelerator at once would recreate exactly the residency this
+    backend exists to avoid, and teardown can run during shutdown or a failed
+    enable when that headroom is not there.
+
+    The ``_omni_layerwise_*`` state is cleared as well. Leaving it set would
+    make a later :func:`stream_declared_encoder_blocks` return early on its
+    idempotence check and never rebuild the hooks, while the blocks are still
+    placeholders.
+    """
+    hooks = getattr(module, "_omni_layerwise_hooks", None) or []
+    for hook in hooks:
+        hook.restore_next_block_to_host()
+    for blocks in getattr(module, "_omni_layerwise_block_groups", None) or []:
+        for block in blocks:
+            remove_block_hook(block)
+    module._omni_layerwise_hooks = []
+    module._omni_layerwise_block_groups = []
+    module._omni_layerwise_enabled = False
+
+
 def remove_block_hook(module: nn.Module) -> None:
     registry: HookRegistry | None = getattr(module, "_hook_registry", None)
     if registry is not None:
@@ -315,6 +448,10 @@ class LayerWiseOffloadBackend(OffloadBackend):
 
         self.copy_stream = current_omni_platform.Stream()
         self._blocks: list[list[nn.Module]] = []
+        # Encoders whose declared block stacks this backend streamed. Tracked
+        # separately from `_blocks` because their teardown has to also clear the
+        # `_omni_layerwise_*` state the helper wrote onto the module.
+        self._streamed_encoders: list[nn.Module] = []
 
     def enable(self, pipeline: nn.Module) -> None:
         if self.enabled:
@@ -326,9 +463,29 @@ class LayerWiseOffloadBackend(OffloadBackend):
             logger.warning("No DiT/transformer modules found, skipping layer-wise offloading")
             return
 
-        # Move encoders to GPU (they stay resident)
-        for enc in modules.encoders:
-            enc.to(self.device)
+        # Page a declared encoder's block stacks the way DiT blocks are paged, so
+        # they are not all resident at once. Streaming the blocks is not the same
+        # as placing the encoder: installing the hooks swaps each block parameter
+        # for an empty placeholder, and everything else -- norms, embeddings,
+        # projections -- is still on host memory and still needed on the device
+        # for the first forward. So the encoder is placed either way; after the
+        # hooks are installed `to()` only carries that non-block state.
+        #
+        # This mirrors the distributed layer-wise backend, which calls
+        # `_register_on_demand_hook` after installing the same hooks: a component
+        # the pipeline declares as on-demand is parked in host memory and left to
+        # the pipeline's own load/release lifecycle, and everything else is made
+        # resident.
+        plan = get_offload_plan(pipeline)
+        declared_on_demand = plan.on_demand_component_paths if plan is not None else frozenset()
+        for enc, enc_name in zip(modules.encoders, modules.encoder_names):
+            if stream_declared_encoder_blocks(enc, enc_name, plan, self.device, pin_memory=self.config.pin_cpu_memory):
+                self._streamed_encoders.append(enc)
+            offload_to_cpu = getattr(enc, "offload_to_cpu", None)
+            if enc_name in declared_on_demand and callable(offload_to_cpu):
+                offload_to_cpu()
+            else:
+                enc.to(self.device)
 
         # Move VAE(s) to GPU if available
         for vae in modules.vaes:
@@ -431,6 +588,13 @@ class LayerWiseOffloadBackend(OffloadBackend):
             self.enabled = True
 
     def disable(self) -> None:
+        # Not gated on `self.enabled`: that flag only tracks DiT blocks, and a
+        # pipeline whose DiT has no streamable block list still gets its
+        # declared encoder blocks streamed above. Those hooks must come off too.
+        for enc in self._streamed_encoders:
+            teardown_streamed_encoder_blocks(enc)
+        self._streamed_encoders.clear()
+
         if not self.enabled:
             return
 
