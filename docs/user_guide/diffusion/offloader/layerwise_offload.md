@@ -18,8 +18,12 @@ stream.
 | ... | ... | ... | ... |
 | last block | Prefetch block 0 | Compute last block | Free last block |
 
-Encoders, VAE modules, and non-block DiT modules such as embeddings and norms
-remain device resident.
+Encoders are device resident by default. A pipeline may declare which of an
+encoder's submodules are streamable block stacks, through
+`OffloadPlan.encoder_block_attrs`; those stacks are paged the same way DiT
+blocks are, and only the encoder's non-block state (norms, embeddings,
+projections) is placed on the device. VAE modules and non-block DiT modules
+such as embeddings and norms remain device resident.
 
 ## Usage
 
