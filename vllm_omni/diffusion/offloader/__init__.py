@@ -7,7 +7,14 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.platforms import current_omni_platform
 
-from .base import OffloadBackend, OffloadConfig, OffloadStrategy
+from .base import (
+    OffloadBackend,
+    OffloadConfig,
+    OffloadStrategy,
+    can_stage_on_demand,
+    host_staged_component_names,
+    model_level_vae_host_staging_requested,
+)
 from .block_discovery import get_blocks_attr_names, get_blocks_from_dit, set_blocks_attr_names
 from .distributed_layerwise_backend import (
     DistributedLayerwiseOffloadBackend,
@@ -43,6 +50,9 @@ __all__ = [
     "DistributedLayerwiseOffloadHook",
     "ModelLevelOffloadBackend",
     "PinnedModuleStager",
+    "can_stage_on_demand",
+    "host_staged_component_names",
+    "model_level_vae_host_staging_requested",
     "apply_sequential_offload",
     "remove_sequential_offload",
     "apply_distributed_block_hook",
