@@ -1230,7 +1230,7 @@ def test_video_vae_keeps_reference_fp32_weights(monkeypatch):
     monkeypatch.setattr(
         vae_module,
         "_load_remote_component",
-        lambda _path, _config: FakeRemote(),
+        lambda _path, _config, *, trust_remote_code: FakeRemote(),
     )
 
     video_vae = vae_module.MiniMaxH3VideoVAE(
@@ -1261,7 +1261,7 @@ def test_video_vae_can_load_on_cpu_for_staged_gpu_residency(monkeypatch):
     monkeypatch.setattr(
         vae_module,
         "_load_remote_component",
-        lambda _path, _config: FakeRemote(),
+        lambda _path, _config, *, trust_remote_code: FakeRemote(),
     )
 
     video_vae = vae_module.MiniMaxH3VideoVAE(
@@ -1296,7 +1296,7 @@ def test_video_vae_uses_snapshot_stager_for_accelerator_target(monkeypatch):
     monkeypatch.setattr(
         vae_module,
         "_load_remote_component",
-        lambda _path, _config: FakeRemote(),
+        lambda _path, _config, *, trust_remote_code: FakeRemote(),
     )
     monkeypatch.setattr(vae_module, "PinnedModuleStager", stager_cls)
 
@@ -1315,6 +1315,123 @@ def test_video_vae_uses_snapshot_stager_for_accelerator_target(monkeypatch):
     )
     stager.load.assert_called_once_with()
     stager.offload.assert_called_once_with()
+
+
+def test_remote_component_refuses_untrusted_checkpoint_code(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import vae as vae_module
+
+    loaded = []
+
+    def spy_get_class(class_reference, component_path):
+        loaded.append((class_reference, component_path))
+        raise AssertionError("checkpoint code must not be resolved when untrusted")
+
+    monkeypatch.setattr(vae_module, "get_class_from_dynamic_module", spy_get_class)
+
+    with pytest.raises(ValueError, match="--trust-remote-code"):
+        vae_module._load_remote_component(
+            "/checkpoints/video_vae",
+            {"auto_map": {"AutoModel": "modeling_vae.VideoVAE"}},
+            trust_remote_code=False,
+        )
+
+    assert loaded == []
+
+
+def test_remote_component_resolves_checkpoint_code_when_trusted(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import vae as vae_module
+
+    class FakeComponent(torch.nn.Module):
+        @classmethod
+        def from_pretrained(cls, component_path):
+            module = cls()
+            module.loaded_from = component_path
+            return module
+
+    loaded = []
+
+    def spy_get_class(class_reference, component_path):
+        loaded.append((class_reference, component_path))
+        return FakeComponent
+
+    monkeypatch.setattr(vae_module, "get_class_from_dynamic_module", spy_get_class)
+
+    module = vae_module._load_remote_component(
+        "/checkpoints/video_vae",
+        {"auto_map": {"AutoModel": "modeling_vae.VideoVAE"}},
+        trust_remote_code=True,
+    )
+
+    # Negative control: the trusted path stays byte-for-byte the pre-gate call.
+    assert loaded == [("modeling_vae.VideoVAE", "/checkpoints/video_vae")]
+    assert module.loaded_from == "/checkpoints/video_vae"
+
+
+@pytest.mark.parametrize("vae_cls_name", ["MiniMaxH3VideoVAE", "MiniMaxH3AudioVAE"])
+@pytest.mark.parametrize("trusted", [True, False])
+def test_vae_forwards_trust_remote_code_to_loader(monkeypatch, vae_cls_name, trusted):
+    from vllm_omni.diffusion.models.minimax_h3 import vae as vae_module
+
+    class FakeRemote(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = torch.nn.Linear(1, 1)
+
+    forwarded = []
+
+    def spy_load(_component_path, _config, *, trust_remote_code):
+        forwarded.append(trust_remote_code)
+        return FakeRemote()
+
+    monkeypatch.setattr(
+        vae_module,
+        "_load_component_config",
+        lambda _path: {
+            "latent_channels": 1,
+            "latents_mean": [0.0],
+            "latents_std": [1.0],
+            "sample_rate": 32000,
+        },
+    )
+    monkeypatch.setattr(vae_module, "_load_remote_component", spy_load)
+
+    vae_cls = getattr(vae_module, vae_cls_name)
+    vae_cls(
+        "unused",
+        device=torch.device("cpu"),
+        trust_remote_code=trusted,
+    )
+
+    assert forwarded == [trusted]
+
+
+@pytest.mark.parametrize("vae_cls_name", ["MiniMaxH3VideoVAE", "MiniMaxH3AudioVAE"])
+def test_vae_defaults_to_refusing_checkpoint_code(monkeypatch, vae_cls_name):
+    from vllm_omni.diffusion.models.minimax_h3 import vae as vae_module
+
+    forwarded = []
+
+    def spy_load(_component_path, _config, *, trust_remote_code):
+        forwarded.append(trust_remote_code)
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(
+        vae_module,
+        "_load_component_config",
+        lambda _path: {
+            "latent_channels": 1,
+            "latents_mean": [0.0],
+            "latents_std": [1.0],
+            "sample_rate": 32000,
+        },
+    )
+    monkeypatch.setattr(vae_module, "_load_remote_component", spy_load)
+
+    vae_cls = getattr(vae_module, vae_cls_name)
+    with pytest.raises(AssertionError, match="unreachable"):
+        vae_cls("unused", device=torch.device("cpu"))
+
+    assert forwarded == [False]
 
 
 def test_video_vae_encode_uses_configured_parallel_tiling():
