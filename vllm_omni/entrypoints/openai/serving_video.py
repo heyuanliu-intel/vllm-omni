@@ -100,34 +100,20 @@ class OmniOpenAIServingVideo:
         if self._stage_configs is None and stage_configs is not None:
             self._stage_configs = stage_configs
 
-    def _diffusion_capability(self, name: str) -> bool:
-        """Resolve one boolean model capability for the configured pipeline.
-
-        An explicit boolean on ``od_config`` wins; otherwise the value comes
-        from the model metadata registry, which defaults to false for models
-        that declare nothing.
-        """
+    @property
+    def supports_mixed_reference_inputs(self) -> bool:
+        """Return whether the configured diffusion model accepts mixed refs."""
         get_od_config = getattr(self._engine_client, "get_diffusion_od_config", None)
         od_config = get_od_config() if callable(get_od_config) else getattr(self._engine_client, "od_config", None)
         if od_config is None:
             return False
 
-        capability = getattr(od_config, name, None)
+        capability = getattr(od_config, "supports_mixed_reference_inputs", None)
         if isinstance(capability, bool):
             return capability
 
         model_class_name = getattr(od_config, "model_class_name", None)
-        return bool(getattr(get_diffusion_model_metadata(model_class_name), name))
-
-    @property
-    def supports_mixed_reference_inputs(self) -> bool:
-        """Return whether the configured diffusion model accepts mixed refs."""
-        return self._diffusion_capability("supports_mixed_reference_inputs")
-
-    @property
-    def pipeline_owns_reference_geometry(self) -> bool:
-        """Return whether the pipeline derives reference geometry itself."""
-        return self._diffusion_capability("pipeline_owns_reference_geometry")
+        return get_diffusion_model_metadata(model_class_name).supports_mixed_reference_inputs
 
     @classmethod
     def for_diffusion(
@@ -168,16 +154,7 @@ class OmniOpenAIServingVideo:
         provided_fields = request.model_fields_set
         fps_provided = self._request_fps_provided(request)
         vp = request.resolve_video_params()
-        # Pipelines that own reference geometry receive the client's original
-        # image: they rescale it themselves and validate it as sent, so
-        # resizing to the requested output size here would distort what the
-        # pipeline encodes and make those checks describe the resized copy.
-        if (
-            input_image is not None
-            and vp.width is not None
-            and vp.height is not None
-            and not self.pipeline_owns_reference_geometry
-        ):
+        if input_image is not None and vp.width is not None and vp.height is not None:
             target_size = (vp.width, vp.height)
             image_items = input_image if isinstance(input_image, list) else [input_image]
             resized_images = [

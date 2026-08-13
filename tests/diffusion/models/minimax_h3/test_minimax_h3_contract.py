@@ -978,22 +978,6 @@ def test_minimax_h3_advertises_the_official_ref2va_image_limit():
     assert get_diffusion_model_metadata("MiniMaxH3Pipeline").max_multimodal_image_inputs == 9
 
 
-@pytest.mark.parametrize("model_class_name", ["MiniMaxH3Pipeline", "MiniMaxH3ModularPipeline"])
-def test_minimax_h3_owns_its_reference_geometry(model_class_name):
-    from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
-
-    # H3 rescales references itself and validates them as sent, so the serving
-    # layer must not pre-resize them.
-    assert get_diffusion_model_metadata(model_class_name).pipeline_owns_reference_geometry
-
-
-@pytest.mark.parametrize("model_class_name", ["WanImageToVideoPipeline", None, "NotARegisteredPipeline"])
-def test_reference_geometry_ownership_is_opt_in(model_class_name):
-    from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
-
-    assert not get_diffusion_model_metadata(model_class_name).pipeline_owns_reference_geometry
-
-
 def test_encoder_forward_uses_hook_compatible_encode_entrypoint():
     from vllm_omni.diffusion.models.minimax_h3.encoder import (
         MiniMaxH3Qwen3VLEncoder,
