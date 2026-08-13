@@ -27,7 +27,20 @@ class OffloadPlan:
     1. ``_layerwise_offload_blocks_attrs`` on each DiT module class.
     2. Heuristic search for ``layers`` / ``blocks`` / ``h`` attributes.
 
+    Most fields describe distributed layer-wise topology and are read only by
+    that backend. ``on_demand_component_paths`` is the exception: it states a
+    property of the *pipeline* -- that it loads and releases the component
+    itself -- so every offload backend may read it to decide whether the
+    component is allowed to stay in host memory.
+
     Attributes:
+        on_demand_component_paths: Component paths the pipeline stages itself,
+            loading them before use and releasing them afterwards.
+            **Backend-independent**: read by the distributed layer-wise backend
+            and by model-level offload. Declaring a path here does not by itself
+            change placement -- the backend also requires the component to
+            expose ``load_to_device``/``offload_to_cpu``, and model-level offload
+            additionally requires the operator to ask for it.
         block_attrs: Maps DiT path → tuple of block-list attribute names.
             e.g. ``{"transformer": ("gen_layers",),
                     "transformer.language_model": ("layers",)}``

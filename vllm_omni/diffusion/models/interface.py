@@ -90,7 +90,9 @@ class SupportsComponentDiscovery(Protocol):
     Attributes:
         _dit_modules: Denoising submodules (on GPU during diffusion).
         _encoder_modules: Encoder submodules (offloaded during diffusion).
-        _vae_modules: VAE(s) (always on GPU).
+        _vae_modules: VAE(s). Never swapped by the mutual exclusion hooks;
+            GPU-resident unless the pipeline stages them itself and the
+            operator sets ``vae_cpu_offload``.
         _resident_modules: Extra modules pinned on GPU during layerwise
             offloading.  Optional, defaults to ``[]``.
     """

@@ -1069,6 +1069,48 @@ def test_diffusion_config_field_classification_covers_current_fields():
     assert "prompt_file_path" in omni_config_module._DIFFUSION_RUNTIME_CONFIG_FIELDS
 
 
+def test_structured_engine_overrides_carry_vae_cpu_offload():
+    """The structured/deploy path must forward the host-staged VAE opt-in.
+
+    Field-set introspection only proves the field exists; this drives an actual
+    value through the override selection and the projection so a dropped hop
+    cannot silently fall back to ``False``.
+    """
+    overrides = omni_config_module._DiffusionEngineOverrides.from_engine(
+        {"enable_cpu_offload": True, "vae_cpu_offload": True}
+    )
+
+    assert overrides.to_kwargs()["vae_cpu_offload"] is True
+
+    projection = omni_config_module._DiffusionConfigProjection.from_kwargs(**overrides.to_kwargs())
+
+    assert projection.vae_cpu_offload is True
+    assert omni_config_module._DiffusionConfigProjection().vae_cpu_offload is False
+
+
+def test_stage_deploy_config_carries_vae_cpu_offload_into_the_diffusion_projection():
+    """The deploy/schema hop must forward the flag, not just the projection hop.
+
+    `_stage_engine_overrides()` enumerates `StageDeployConfig`'s own fields, so a
+    field missing there is dropped before the projection is ever built -- and a
+    test that calls `_DiffusionEngineOverrides.from_engine()` with a hand-written
+    dict would still pass. Drive the real dataclass through the real selector.
+    """
+    stage_deploy = StageDeployConfig(stage_id=0, vae_cpu_offload=True)
+
+    engine = omni_config_module._stage_engine_overrides(stage_deploy)
+
+    assert engine["vae_cpu_offload"] is True, "the deploy schema hop dropped the field"
+
+    projection = omni_config_module._DiffusionConfigProjection.from_kwargs(
+        **omni_config_module._DiffusionEngineOverrides.from_engine(engine).to_kwargs()
+    )
+
+    assert projection.vae_cpu_offload is True
+    # A deploy config that does not set it must not fabricate a value.
+    assert "vae_cpu_offload" not in omni_config_module._stage_engine_overrides(StageDeployConfig(stage_id=0))
+
+
 def test_diffusion_config_projection_keeps_mapping_quantization_config_serializable():
     quantization_config = {
         "method": "example_quant",

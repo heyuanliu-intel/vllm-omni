@@ -44,6 +44,7 @@ from vllm_omni.diffusion.models.interface import (
 )
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.offloader import OffloadPlan
+from vllm_omni.diffusion.offloader.base import model_level_vae_host_staging_requested
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
 )
@@ -694,8 +695,15 @@ class MiniMaxH3Pipeline(
             load_model=rank < text_encoder_tp_size,
             encoder_group=self.text_encoder_group,
         )
+        # The VAEs must be *constructed* wherever they are going to live: building
+        # them on the accelerator and only later declining to move them there
+        # would leave the weights resident anyway, and would skip the pinned
+        # staging path in the adapters. Use the same policy predicate the offload
+        # backend uses so the two cannot drift apart.
         stage_components = bool(
-            od_config.enable_layerwise_offload or getattr(od_config, "enable_distributed_layerwise_offload", False)
+            od_config.enable_layerwise_offload
+            or getattr(od_config, "enable_distributed_layerwise_offload", False)
+            or model_level_vae_host_staging_requested(od_config)
         )
         component_load_device = torch.device("cpu") if stage_components else self.device
         self.video_vae = MiniMaxH3VideoVAE(
@@ -1148,6 +1156,7 @@ class MiniMaxH3Pipeline(
         return bool(
             getattr(od_config, "enable_layerwise_offload", False)
             or getattr(od_config, "enable_distributed_layerwise_offload", False)
+            or model_level_vae_host_staging_requested(od_config)
         )
 
     @contextmanager
@@ -1244,7 +1253,12 @@ class MiniMaxH3Pipeline(
                     max_samples = int(round(max_duration_seconds * int(sample_rate)))
                     waveform = waveform[..., :max_samples]
                 bounded_audios.append((waveform, sample_rate))
-            encoded = [self.audio_vae.encode_waveform(*audio) for audio in bounded_audios]
+            # Stage once around the whole batch: ``encode_waveform`` runs on
+            # whichever device the weights currently sit on, so a host-staged
+            # VAE would otherwise encode on CPU. One load/offload pair per
+            # batch, not per clip.
+            with self._component_on_device(self.audio_vae):
+                encoded = [self.audio_vae.encode_waveform(*audio) for audio in bounded_audios]
             rows = torch.cat([item[0] for item in encoded])
             lengths = torch.tensor(
                 [int(item[1]) for item in encoded],
