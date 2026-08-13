@@ -691,6 +691,14 @@ class OmniServeCommand(CLISubcommand):
             help="Enable CPU offloading for diffusion models.",
         )
         omni_config_group.add_argument(
+            "--vae-cpu-offload",
+            action="store_true",
+            help=(
+                "Under model-level CPU offloading, let pipelines that stage their own "
+                "components keep the VAE in host memory instead of resident on the accelerator."
+            ),
+        )
+        omni_config_group.add_argument(
             "--enable-layerwise-offload",
             action="store_true",
             help="Enable layerwise (blockwise) offloading on DiT modules.",

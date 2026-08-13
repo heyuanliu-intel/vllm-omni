@@ -71,6 +71,36 @@ class Cosmos3VFMTransformer(nn.Module):
 This preserves the same invariant—exactly one component is device resident—
 while reusing sequential `.to()` movers.
 
+## Host-staged VAEs (`vae_cpu_offload`)
+
+By default model-level offloading keeps VAEs GPU-resident, because the mutual
+exclusion above only swaps the DiT and the encoders. For pipelines that stage
+and release their VAEs around each use, holding those weights on the
+accelerator for the whole request is pure overhead. `--vae-cpu-offload` lets
+such a pipeline park its VAEs in host memory instead.
+
+**Python API:**
+
+```python
+from vllm_omni import Omni
+
+m = Omni(model="MiniMaxAI/MiniMax-H3", enable_cpu_offload=True, vae_cpu_offload=True)
+```
+
+**CLI:**
+
+```bash
+vllm serve MiniMaxAI/MiniMax-H3 --omni --enable-cpu-offload --vae-cpu-offload
+```
+
+The flag only takes effect when model-level offloading is on and the pipeline
+declares its VAEs as on-demand components. If any condition fails the VAE stays
+resident, which is the previous behavior. Each VAE use then pays a load and an
+offload, so it pays off when the VAE is large relative to how often it runs, and
+costs throughput when the VAE runs frequently.
+
+Currently supported by: MiniMax-H3 (`video_vae`, `audio_vae`).
+
 ## Limitations
 
 - Single device only.

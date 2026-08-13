@@ -31,6 +31,10 @@ class OffloadConfig:
     # blocks from the loader-selected host backing with H2D only.
     dlo_use_allgather: bool = True
     dlo_resident_layers: int = 0  # leading DiT layers kept on device
+    model_path: str | None = None  # checkpoint path for mmap weight loading
+    # Operator policy: under model-level offload, allow pipeline-staged VAEs to
+    # stay in host memory instead of resident on the device.
+    vae_cpu_offload: bool = False
 
     @classmethod
     def from_od_config(cls, od_config: OmniDiffusionConfig) -> "OffloadConfig":
@@ -51,6 +55,7 @@ class OffloadConfig:
             OffloadConfig with validated settings
         """
         enable_cpu_offload = getattr(od_config, "enable_cpu_offload", False)
+        vae_cpu_offload = getattr(od_config, "vae_cpu_offload", False)
         enable_layerwise_offload = getattr(od_config, "enable_layerwise_offload", False)
         enable_distributed_layerwise_offload = getattr(od_config, "enable_distributed_layerwise_offload", False)
         pin_cpu_memory = getattr(od_config, "pin_cpu_memory", True)
@@ -136,7 +141,57 @@ class OffloadConfig:
             dp_size=dp_size,
             dlo_use_allgather=dlo_use_allgather,
             dlo_resident_layers=dlo_resident_layers,
+            model_path=getattr(od_config, "model", None),
+            vae_cpu_offload=bool(vae_cpu_offload),
         )
+
+
+def can_stage_on_demand(module: nn.Module) -> bool:
+    """Return whether a component loads and releases itself on demand.
+
+    Pipelines that manage their own residency expose this pair; the offload
+    backends require it before allowing a component to stay in host memory.
+    Mirrors the check the distributed layer-wise backend already makes.
+    """
+    return callable(getattr(module, "load_to_device", None)) and callable(getattr(module, "offload_to_cpu", None))
+
+
+def model_level_vae_host_staging_requested(od_config: "OmniDiffusionConfig") -> bool:
+    """Return whether the operator asked for host-staged VAEs at model level.
+
+    Single source of truth for the policy half of the decision, so a pipeline
+    deciding where to *construct* its VAEs and the backend deciding where to
+    *keep* them cannot drift apart. The capability half -- the pipeline
+    declaring the component on-demand and the component exposing the staging
+    pair -- is checked separately by :func:`host_staged_component_names`.
+    """
+    return bool(getattr(od_config, "enable_cpu_offload", False) and getattr(od_config, "vae_cpu_offload", False))
+
+
+def host_staged_component_names(
+    pipeline: nn.Module,
+    modules: list[nn.Module],
+    names: list[str],
+    *,
+    policy_requested: bool,
+) -> list[str]:
+    """Return the components that may stay in host memory.
+
+    Three conditions, all required: the operator asked for it, the pipeline
+    declared the component as one it stages itself, and the component exposes
+    the staging pair. Anything else keeps the resident placement, so a pipeline
+    that cannot stage on demand degrades to the old behavior instead of failing
+    later inside encode/decode.
+    """
+    if not policy_requested:
+        return []
+    from vllm_omni.diffusion.offloader.offload_plan import get_offload_plan
+
+    plan = get_offload_plan(pipeline)
+    if plan is None:
+        return []
+    declared = plan.on_demand_component_paths
+    return [name for module, name in zip(modules, names) if name in declared and can_stage_on_demand(module)]
 
 
 class OffloadBackend(ABC):

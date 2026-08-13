@@ -167,7 +167,7 @@ vllm serve Qwen/Qwen-Image --omni --port 8091 \
 
 - **CPU Offloading — Strategies Are Mutually Exclusive**: Distributed layerwise, layerwise, and model-level offload should not be enabled together. Selection priority is distributed layerwise, then layerwise, then model-level.
 
-- **CPU Offloading — VAE stays on GPU**: Both offloading strategies keep the VAE on GPU at all times. For high-resolution generation, VAE decode can still cause OOM. Mitigate by combining with `vae_use_tiling=True` or VAE Patch Parallelism.
+- **CPU Offloading — VAE stays on GPU by default**: Both offloading strategies keep the VAE on GPU unless the pipeline opts into host staging. Under model-level offload, pipelines that declare `OffloadPlan.on_demand_component_paths` and expose `load_to_device`/`offload_to_cpu` can park the VAE in host memory with `vae_cpu_offload=True` (default `false`; ignored by the layerwise backends, and silently a no-op for pipelines that do not meet those conditions). For high-resolution generation, VAE decode can still cause OOM. Mitigate by combining with `vae_use_tiling=True` or VAE Patch Parallelism.
 
 - **VAE Patch Parallelism — DistributedVaeExecutor Required**: VAE Patch Parallelism is only enabled for models that have `DistributedVaeExecutor`. Unsupported models will silently ignore `vae_patch_parallel_size`, and use sequential vae tiling instead.
 

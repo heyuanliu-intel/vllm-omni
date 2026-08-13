@@ -9,7 +9,11 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
 from vllm_omni.platforms import current_omni_platform
 
-from .base import OffloadBackend, OffloadConfig
+from .base import (
+    OffloadBackend,
+    OffloadConfig,
+    host_staged_component_names,
+)
 from .module_collector import ModuleDiscovery
 
 logger = init_logger(__name__)
@@ -279,8 +283,39 @@ class ModelLevelOffloadBackend(OffloadBackend):
         for enc in modules.encoders:
             enc.to(self.device)
 
+        # A pipeline that stages its own VAEs -- loading each one before use and
+        # releasing it afterwards -- does not need them resident for the whole
+        # request. Keep those in host memory when the operator asked for it, and
+        # confirm the placement rather than assuming the loader already chose it:
+        # `offload_to_cpu()` is idempotent and stays correct even if something
+        # else moved the component. Mirrors the decision the distributed
+        # layer-wise backend makes in `_register_on_demand_hook`.
+        staged_vae_names = host_staged_component_names(
+            pipeline,
+            modules.vaes,
+            modules.vae_names,
+            policy_requested=self.config.vae_cpu_offload,
+        )
+        if staged_vae_names:
+            for vae, name in zip(modules.vaes, modules.vae_names):
+                if name in staged_vae_names:
+                    vae.offload_to_cpu()
+            logger.info(
+                "Model-level offloading keeps the VAE(s) in host memory: %s",
+                ", ".join(staged_vae_names),
+            )
+        elif self.config.vae_cpu_offload and modules.vaes:
+            logger.warning(
+                "vae_cpu_offload requested but %s is not declared on-demand by %s "
+                "or cannot stage itself; keeping the VAE(s) resident on %s",
+                ", ".join(modules.vae_names),
+                pipeline.__class__.__name__,
+                self.device,
+            )
+        resident_vaes = [vae for vae, name in zip(modules.vaes, modules.vae_names) if name not in staged_vae_names]
+
         # Move VAE(s) to GPU if available
-        for vae in modules.vaes:
+        for vae in resident_vaes:
             try:
                 vae.to(self.device, non_blocking=True)
             except Exception as exc:

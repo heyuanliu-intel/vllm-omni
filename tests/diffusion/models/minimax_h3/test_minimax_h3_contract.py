@@ -866,6 +866,123 @@ def test_minimax_h3_accepts_sglang_auto_aspect_ratio_alias():
     assert (height, width) == (768, 1344)
 
 
+@pytest.mark.parametrize(
+    ("enable_cpu_offload", "vae_cpu_offload", "expect_host"),
+    [
+        (True, True, True),  # opt-in: construct in host memory so staging is real
+        (True, False, False),  # model-level alone keeps the legacy resident placement
+        (False, True, False),  # no offload strategy, nothing to stage
+    ],
+)
+def test_minimax_h3_constructs_vaes_where_they_will_live(
+    monkeypatch, tmp_path, enable_cpu_offload, vae_cpu_offload, expect_host
+):
+    """The construction device must follow the same predicate as the backend.
+
+    Building the VAEs on the accelerator and only later declining to move them
+    there would leave the weights resident anyway, and would skip the pinned
+    staging path in the adapters. This drives the real pipeline constructor and
+    reads the ``load_device`` the VAE adapters actually receive.
+    """
+    from vllm_omni.diffusion.data import (
+        DiffusionParallelConfig,
+        OmniDiffusionConfig,
+    )
+    from vllm_omni.diffusion.models.minimax_h3 import (
+        pipeline_minimax_h3 as pipeline_module,
+    )
+
+    _write_partition_index(tmp_path / "FL2VA", partition="fl2va", tasks=["t2va", "fl2va"])
+    _write_partition_index(tmp_path / "Ref2VA", partition="ref2va", tasks=["ref2va"])
+    for partition_name in ("FL2VA", "Ref2VA"):
+        for component in ("transformer", "tokenizer", "processor", "text_encoder", "video_vae", "audio_vae"):
+            (tmp_path / partition_name / component).mkdir(parents=True, exist_ok=True)
+
+    load_devices: dict[str, torch.device | None] = {}
+
+    class FakeModule(torch.nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+
+    def vae_factory(name):
+        def create(path, *args, **kwargs):
+            load_devices[name] = kwargs.get("load_device")
+            return FakeModule()
+
+        return create
+
+    class FakeFromPretrained:
+        """Stands in for the HF tokenizer/processor the constructor loads."""
+
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            return cls()
+
+    monkeypatch.setattr(pipeline_module, "MiniMaxH3DiTModel", FakeModule)
+    monkeypatch.setattr(pipeline_module, "MiniMaxH3Qwen3VLEncoder", lambda *a, **k: FakeModule())
+    monkeypatch.setattr(pipeline_module, "MiniMaxH3VideoVAE", vae_factory("video_vae"))
+    monkeypatch.setattr(pipeline_module, "MiniMaxH3AudioVAE", vae_factory("audio_vae"))
+    monkeypatch.setattr(pipeline_module, "Qwen2TokenizerFast", FakeFromPretrained)
+    monkeypatch.setattr(pipeline_module, "Qwen3VLProcessor", FakeFromPretrained)
+    monkeypatch.setattr(pipeline_module, "_dit_rank_world", lambda: (None, 0, 1))
+    monkeypatch.setattr(pipeline_module, "get_local_device", lambda: torch.device("meta"))
+    monkeypatch.setattr(pipeline_module, "download_weights_from_hf_specific", lambda **kwargs: str(tmp_path))
+
+    od_config = OmniDiffusionConfig(
+        model=str(tmp_path),
+        task_type="fl2va",
+        enable_cpu_offload=enable_cpu_offload,
+        vae_cpu_offload=vae_cpu_offload,
+        parallel_config=DiffusionParallelConfig(cfg_parallel_size=1, text_encoder_tp_size=1),
+    )
+    pipeline_module.MiniMaxH3Pipeline(od_config=od_config)
+
+    assert set(load_devices) == {"video_vae", "audio_vae"}
+    for name, device in load_devices.items():
+        assert (device is not None and device.type == "cpu") is expect_host, name
+
+
+def test_minimax_h3_declares_its_vaes_as_on_demand_components():
+    """The staging decision reads this declaration; keep it explicit."""
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    declared = MiniMaxH3Pipeline._offload_plan.on_demand_component_paths
+    assert {"video_vae", "audio_vae"} <= set(declared)
+
+
+def test_host_staged_component_names_requires_all_three_conditions():
+    """Policy, declaration and the staging pair are each necessary."""
+    from vllm_omni.diffusion.offloader.base import host_staged_component_names
+    from vllm_omni.diffusion.offloader.offload_plan import OffloadPlan
+
+    class Stageable(torch.nn.Module):
+        def load_to_device(self) -> None:
+            return None
+
+        def offload_to_cpu(self) -> None:
+            return None
+
+    class Plain(torch.nn.Module):
+        pass
+
+    class Pipeline(torch.nn.Module):
+        _offload_plan = OffloadPlan(on_demand_component_paths=frozenset({"video_vae"}))
+
+    class NoPlan(torch.nn.Module):
+        pass
+
+    pipeline = Pipeline()
+    modules = [Stageable(), Stageable(), Plain()]
+    names = ["video_vae", "audio_vae", "vae"]
+
+    # declared + stageable + policy -> only the declared, stageable one
+    assert host_staged_component_names(pipeline, modules, names, policy_requested=True) == ["video_vae"]
+    # policy off -> nothing, whatever the pipeline declares
+    assert host_staged_component_names(pipeline, modules, names, policy_requested=False) == []
+    # no plan at all -> nothing
+    assert host_staged_component_names(NoPlan(), modules, names, policy_requested=True) == []
+
+
 def test_minimax_h3_advertises_the_official_ref2va_image_limit():
     from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 
@@ -2120,6 +2237,50 @@ def test_ref2va_standalone_audio_condition_is_bounded_to_output_duration():
     assert observed[0][1] == 10
     assert encoded.shape == (1, 25)
     assert lengths == [25]
+
+
+def test_ref2va_standalone_audio_stages_the_vae_once_around_the_batch(monkeypatch):
+    """Host-staged audio VAEs must be on the accelerator before encoding.
+
+    ``encode_waveform`` picks its execution device from the weights, so a
+    standalone Ref2VA batch that skips the staging scope would silently encode
+    on CPU. The event log also pins *one* load/offload pair per batch: staging
+    per clip would pay the transfer once per audio.
+    """
+    from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as pipeline_module
+
+    monkeypatch.setattr(pipeline_module, "_dit_rank_world", lambda: (None, 0, 1))
+
+    pipeline = object.__new__(pipeline_module.MiniMaxH3Pipeline)
+    pipeline.device = torch.device("cpu")
+    pipeline.od_config = OmniDiffusionConfig(
+        model="MiniMaxAI/MiniMax-H3",
+        enable_cpu_offload=True,
+        vae_cpu_offload=True,
+        parallel_config=DiffusionParallelConfig(cfg_parallel_size=1, text_encoder_tp_size=1),
+    )
+
+    events: list[str] = []
+
+    class StageableAudioVAE:
+        def load_to_device(self) -> None:
+            events.append("load")
+
+        def offload_to_cpu(self) -> None:
+            events.append("offload")
+
+        def encode_waveform(self, waveform, sample_rate):
+            events.append("encode")
+            return waveform, waveform.shape[-1]
+
+    pipeline.audio_vae = StageableAudioVAE()
+    waveform = torch.zeros(1, 20, dtype=torch.float32)
+
+    _, lengths = pipeline._encode_audio_conditions([(waveform, 10), (waveform, 10)])
+
+    assert events == ["load", "encode", "encode", "offload"]
+    assert lengths == [20, 20]
 
 
 @pytest.mark.parametrize(

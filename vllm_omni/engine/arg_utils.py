@@ -542,6 +542,7 @@ class OrchestratorArgs:
     enable_multithread_weight_load: bool = True
     num_weight_load_threads: int = 4
     enable_cpu_offload: bool = False
+    vae_cpu_offload: bool = False
     enable_layerwise_offload: bool = False
     enable_distributed_layerwise_offload: bool = False
     dlo_use_allgather: bool = True
