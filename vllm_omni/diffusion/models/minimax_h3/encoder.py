@@ -76,9 +76,10 @@ class MiniMaxH3Qwen3VLVocabParallelEmbedding(nn.Module):
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
         tp_rank, tp_size = _tp_range(group)
-        assert num_embeddings % tp_size == 0, (
-            f"vocab_size {num_embeddings} must be divisible by text_encoder_tp_size {tp_size}"
-        )
+        if num_embeddings % tp_size:
+            raise ValueError(
+                f"vocab_size {num_embeddings} must be divisible by text_encoder_tp_size {tp_size}"
+            )
         self.num_embeddings_per_partition = num_embeddings // tp_size
         self.weight = nn.Parameter(torch.empty(self.num_embeddings_per_partition, embedding_dim, dtype=dtype))
         self.weight.weight_loader = self.weight_loader  # type: ignore[attr-defined]
@@ -127,9 +128,10 @@ class MiniMaxH3Qwen3VLMergedColumnParallelLinear(nn.Module):
         self.input_size = input_size
         self.intermediate_size = intermediate_size
         tp_rank, tp_size = _tp_range(group)
-        assert intermediate_size % tp_size == 0, (
-            f"intermediate_size {intermediate_size} must be divisible by text_encoder_tp_size {tp_size}"
-        )
+        if intermediate_size % tp_size:
+            raise ValueError(
+                f"intermediate_size {intermediate_size} must be divisible by text_encoder_tp_size {tp_size}"
+            )
         self.intermediate_size_per_partition = intermediate_size // tp_size
         self.weight = nn.Parameter(torch.empty(2 * self.intermediate_size_per_partition, input_size, dtype=dtype))
         self.weight.weight_loader = self.weight_loader  # type: ignore[attr-defined]
@@ -169,12 +171,14 @@ class MiniMaxH3Qwen3VLQKVParallelLinear(nn.Module):
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         tp_rank, tp_size = _tp_range(group)
-        assert num_heads % tp_size == 0, (
-            f"num_attention_heads {num_heads} must be divisible by text_encoder_tp_size {tp_size}"
-        )
-        assert num_kv_heads % tp_size == 0, (
-            f"num_key_value_heads {num_kv_heads} must be divisible by text_encoder_tp_size {tp_size}"
-        )
+        if num_heads % tp_size:
+            raise ValueError(
+                f"num_attention_heads {num_heads} must be divisible by text_encoder_tp_size {tp_size}"
+            )
+        if num_kv_heads % tp_size:
+            raise ValueError(
+                f"num_key_value_heads {num_kv_heads} must be divisible by text_encoder_tp_size {tp_size}"
+            )
         self.local_num_heads = num_heads // tp_size
         self.local_num_kv_heads = num_kv_heads // tp_size
         q_local = self.local_num_heads * head_dim
@@ -221,7 +225,10 @@ class MiniMaxH3Qwen3VLRowParallelLinear(nn.Module):
         self.output_size = output_size
         self.input_is_parallel = input_is_parallel
         tp_rank, tp_size = _tp_range(group)
-        assert input_size % tp_size == 0, f"input_size {input_size} must be divisible by text_encoder_tp_size {tp_size}"
+        if input_size % tp_size:
+            raise ValueError(
+                f"input_size {input_size} must be divisible by text_encoder_tp_size {tp_size}"
+            )
         self.input_size_per_partition = input_size // tp_size
         self.weight = nn.Parameter(torch.empty(output_size, self.input_size_per_partition, dtype=dtype))
         self.weight.weight_loader = self.weight_loader  # type: ignore[attr-defined]
