@@ -6,22 +6,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from time import perf_counter as _h3_perf_counter
-
-
-def _h3_now() -> float:
-    """perf_counter AFTER the device has drained.
-
-    Timing an async device without this measures kernel SUBMISSION and
-    misattributes the work to a later phase. See patch_phase_timers.py.
-    """
-    try:
-        current_omni_platform.synchronize()
-    except Exception:  # no synchronize on this platform: timing degrades, run does not
-        pass
-    return _h3_perf_counter()
 from collections.abc import Iterable
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -315,8 +300,8 @@ class MiniMaxH3Pipeline(
         # _encode_audio_condition instead, and without these two the reference
         # image's VAE encode -- plus the offload swap it triggers, since
         # vae_cpu_offload parks the VAE on the host -- lands in no stage at all.
-        # Measured on B70 TP=4 canon: that gap was a steady 17-18 s, 5.0% of the
-        # request, visible only as `forward - sum(stages)`.
+        # Include both methods so the profiler's stage breakdown accounts for
+        # the complete image-reference path.
         "_encode_visual_condition",
         "_encode_audio_condition",
         "diffuse",
@@ -906,36 +891,6 @@ class MiniMaxH3Pipeline(
         )
         return video_rows, audio_rows
 
-    @contextmanager
-    def _denoise_step_timer(self, step: int):
-        """Time ONE denoise step. Diagnostic only: wired when PROFILER=1.
-
-        ``minimax_h3_denoise_loop`` already accepts a ``step_profiler`` hook
-        (denoise_loop.py:143) -- ``diffuse`` simply never passed one, so the
-        84.7% of the request that lives inside that loop had no decomposition
-        at all. This is the framework's own extension point, not new plumbing.
-
-        Same ``[DiffusionPipelineProfiler]`` prefix as the stage profiler so a
-        single parser reads both, but these lines are INSIDE ``diffuse``:
-        ``prof_summary.py`` keeps them out of the stage table and uses them for
-        the next-level closure check, ``diffuse - sum(steps) = loop setup+tail``.
-
-        Uses ``_h3_now()`` (synchronize, then clock). Without the drain this
-        would time kernel SUBMISSION, which on a cache_dit run is exactly the
-        wrong thing: a skipped step would look free while its work showed up
-        on the next computed step.
-        """
-        t0 = _h3_now()
-        try:
-            yield
-        finally:
-            logger.info(
-                "[DiffusionPipelineProfiler] %s.denoise_step[%d] took %.6fs",
-                type(self).__name__,
-                step,
-                _h3_now() - t0,
-            )
-
     def diffuse(
         self,
         *,
@@ -1080,9 +1035,6 @@ class MiniMaxH3Pipeline(
                 imgvid_cond_noise_aug_for_inference=(MINIMAX_H3_IMGVID_COND_TIMESTEP),
                 audio_cond_noise_aug_for_inference=(MINIMAX_H3_AUDIO_REF_COND_TIMESTEP),
                 on_step=lambda step, video, audio: progress.update(),
-                step_profiler=(
-                    self._denoise_step_timer if getattr(self, "enable_diffusion_pipeline_profiler", False) else None
-                ),
             )
 
         target_video = video_rows[branch.update_mask_dev]
@@ -1164,8 +1116,8 @@ class MiniMaxH3Pipeline(
         if task == "fl2va" and image is not None:
             mismatch = _ar_mismatch_ratio(image.size, width, height)
             if mismatch > ar_tolerance:
-                # Never silently stretch an AR-mismatched frame: crop by
-                # default (owner decision), letterbox on request.
+                # Never silently stretch an AR-mismatched frame: center-crop
+                # by default, with letterbox as an explicit request policy.
                 policy = str(extra.get("frame_ar_policy") or "center_crop")
                 if policy == "center_crop":
                     shaped = _center_crop_to_aspect(image, width, height)
@@ -1251,16 +1203,12 @@ class MiniMaxH3Pipeline(
                     )
                 has_audio = [bool(value) for value in has_audio_tensor.tolist()]
 
-            _h3t_prompt0 = _h3_now()
             text_embeddings, text_tags = self.encode_prompt(
                 task=task,
                 prompt=prompt,
                 image=prepared_image,
                 prepared_videos=prepared_videos,
             )
-            # One drain per boundary, shared with the next phase's start.
-            _h3t_cond0 = _h3_now()
-            _h3t_prompt = _h3t_cond0 - _h3t_prompt0
 
             if prepared_videos is not None or raw_videos is not None:
                 visual_condition, visual_shapes = self._encode_video_conditions(
@@ -1313,8 +1261,6 @@ class MiniMaxH3Pipeline(
             pad_seq_len = int(pad_seq_len)
             if pad_seq_len % 64:
                 raise ValueError(f"pad_seq_len {pad_seq_len} must be a multiple of 64")
-        _h3t_diffuse0 = _h3_now()
-        _h3t_cond = _h3t_diffuse0 - _h3t_cond0
         video_latent, audio_latent = self.diffuse(
             task=task,
             text_embeddings=text_embeddings,
@@ -1337,28 +1283,11 @@ class MiniMaxH3Pipeline(
             audio_condition_lengths=audio_lengths,
             pad_seq_len=pad_seq_len,
         )
-        _h3t_decode0 = _h3_now()
-        _h3t_diffuse = _h3t_decode0 - _h3t_diffuse0
         video, audio = self.decode(
             video_latent,
             audio_latent,
             height=height,
             width=width,
-        )
-        _h3t_decode = _h3_now() - _h3t_decode0
-        logger.info(
-            "[H3Timing] task=%s steps=%d frames=%d size=%dx%d "
-            "prompt=%.2fs cond=%.2fs diffuse=%.2fs decode=%.2fs t_step=%.3fs",
-            task,
-            num_steps,
-            num_frames,
-            width,
-            height,
-            _h3t_prompt,
-            _h3t_cond,
-            _h3t_diffuse,
-            _h3t_decode,
-            (_h3t_diffuse / num_steps) if num_steps > 0 else 0.0,
         )
         return DiffusionOutput(
             output=(video, audio),
