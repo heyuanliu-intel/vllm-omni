@@ -221,6 +221,7 @@ def test_combined_task_inference_and_transformer_routing():
         ("ref2va", "ref2va", 1, "Ref2VA", ["Ref2VA"], {"ref2va"}),
     ],
 )
+@pytest.mark.parametrize("trust_remote_code", [False, True])
 def test_pipeline_loads_task_selected_dits_and_shared_components_once(
     monkeypatch,
     tmp_path,
@@ -230,6 +231,7 @@ def test_pipeline_loads_task_selected_dits_and_shared_components_once(
     component_partition,
     source_partitions,
     expected_tasks,
+    trust_remote_code,
 ):
     from vllm_omni.diffusion.data import (
         DiffusionParallelConfig,
@@ -261,6 +263,7 @@ def test_pipeline_loads_task_selected_dits_and_shared_components_once(
             (tmp_path / partition_name / component).mkdir()
 
     created = {"dit": [], "text_encoder": [], "video_vae": [], "audio_vae": []}
+    created_kwargs = {"text_encoder": [], "video_vae": [], "audio_vae": []}
 
     class FakeModule(torch.nn.Module):
         def __init__(self, *args, **kwargs):
@@ -274,6 +277,7 @@ def test_pipeline_loads_task_selected_dits_and_shared_components_once(
     def component_factory(name):
         def create(path, *args, **kwargs):
             created[name].append(str(path))
+            created_kwargs[name].append(kwargs)
             return FakeModule()
 
         return create
@@ -345,6 +349,7 @@ def test_pipeline_loads_task_selected_dits_and_shared_components_once(
             cfg_parallel_size=1,
             text_encoder_tp_size=1,
         ),
+        trust_remote_code=trust_remote_code,
     )
     pipeline = pipeline_module.MiniMaxH3Pipeline(od_config=od_config)
 
@@ -355,6 +360,10 @@ def test_pipeline_loads_task_selected_dits_and_shared_components_once(
     assert created["text_encoder"] == [str(component_path / "text_encoder")]
     assert created["video_vae"] == [str(component_path / "video_vae")]
     assert created["audio_vae"] == [str(component_path / "audio_vae")]
+    # The checkpoint VAEs execute the modeling code shipped with the weights, so
+    # the pipeline must hand them the engine's trust_remote_code decision.
+    for component in ("video_vae", "audio_vae"):
+        assert [kwargs["trust_remote_code"] for kwargs in created_kwargs[component]] == [trust_remote_code]
     assert len(tokenizer_calls) == 1
     assert len(processor_calls) == 1
     expected_dit_modules = ["transformer", "transformers_ref"] if expected_dits == 2 else ["transformer"]
