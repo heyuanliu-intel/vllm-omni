@@ -18,8 +18,12 @@ stream.
 | ... | ... | ... | ... |
 | last block | Prefetch block 0 | Compute last block | Free last block |
 
-Encoders, VAE modules, and non-block DiT modules such as embeddings and norms
-remain device resident.
+Encoders and non-block DiT modules such as embeddings and norms remain device
+resident. VAE modules remain device resident too, except when the pipeline
+declares the VAE in its `OffloadPlan.on_demand_component_paths` *and* the VAE
+exposes an `offload_to_cpu()` method: such a pipeline loads and releases the
+VAE itself around encode/decode, so layer-wise offloading leaves it in host
+memory instead of keeping a resident copy that is never used.
 
 ## Usage
 

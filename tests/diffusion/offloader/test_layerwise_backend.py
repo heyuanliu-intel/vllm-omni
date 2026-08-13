@@ -246,3 +246,101 @@ class TestGetBlocksAttrNames:
         LayerWiseOffloadBackend.set_blocks_attr_names(model, ["new_blocks"])
         assert hasattr(model.__class__, "_layerwise_offload_blocks_attrs")
         assert model.__class__._layerwise_offload_blocks_attrs == ["new_blocks"]
+
+
+class _StageableVAE(nn.Module):
+    """A VAE that manages its own residency, like MiniMax-H3's adapters."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.linear = nn.Linear(4, 4)
+        self.moves: list[str] = []
+
+    def load_to_device(self) -> None:
+        self.moves.append("load")
+
+    def offload_to_cpu(self) -> None:
+        self.moves.append("offload")
+
+    def to(self, *args, **kwargs):  # noqa: A003 - mirrors nn.Module.to
+        self.moves.append("to")
+        return super().to(*args, **kwargs)
+
+
+class _PlainVAE(nn.Module):
+    """A VAE without the staging pair: it cannot be parked in host memory."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.linear = nn.Linear(4, 4)
+        self.moves: list[str] = []
+
+    def to(self, *args, **kwargs):  # noqa: A003 - mirrors nn.Module.to
+        self.moves.append("to")
+        return super().to(*args, **kwargs)
+
+
+def _layerwise_pipeline_with(vae: nn.Module, *, declared: bool = True) -> nn.Module:
+    from vllm_omni.diffusion.offloader.offload_plan import OffloadPlan
+
+    class Pipeline(nn.Module):
+        _dit_modules = ["transformer"]
+        _encoder_modules = ["text_encoder"]
+        _vae_modules = ["vae"]
+        _offload_plan = OffloadPlan(on_demand_component_paths=frozenset({"vae"} if declared else set()))
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.transformer = nn.Module()
+            self.transformer.blocks = nn.ModuleList([nn.Linear(4, 4)])
+            self.text_encoder = nn.Linear(4, 4)
+            self.vae = vae
+
+    return Pipeline()
+
+
+def _layerwise_backend() -> LayerWiseOffloadBackend:
+    from vllm_omni.diffusion.offloader.base import OffloadConfig, OffloadStrategy
+
+    return LayerWiseOffloadBackend(
+        OffloadConfig(strategy=OffloadStrategy.LAYER_WISE, pin_cpu_memory=False),
+        torch.device("cpu"),
+    )
+
+
+def test_layerwise_backend_leaves_pipeline_staged_vae_in_host_memory(patched_offload_runtime) -> None:
+    """The backend must not undo a staging lifecycle the pipeline already runs.
+
+    A pipeline that declares its VAE on-demand builds it in host memory and
+    loads it only around encode/decode; moving it onto the device here leaves a
+    resident copy that is never the one used.
+    """
+    vae = _StageableVAE()
+    backend = _layerwise_backend()
+
+    backend.enable(_layerwise_pipeline_with(vae))
+
+    assert vae.moves == ["offload"], "declared, stageable VAE must be parked, never moved onto the device"
+    backend.disable()
+
+
+def test_layerwise_backend_keeps_undeclared_vae_resident(patched_offload_runtime) -> None:
+    """No declaration means the pipeline does not stage it: keep today's behavior."""
+    vae = _StageableVAE()
+    backend = _layerwise_backend()
+
+    backend.enable(_layerwise_pipeline_with(vae, declared=False))
+
+    assert "to" in vae.moves and "offload" not in vae.moves
+    backend.disable()
+
+
+def test_layerwise_backend_keeps_unstageable_vae_resident(patched_offload_runtime) -> None:
+    """A declaration the component cannot honor must degrade, not fail later."""
+    vae = _PlainVAE()
+    backend = _layerwise_backend()
+
+    backend.enable(_layerwise_pipeline_with(vae))
+
+    assert vae.moves == ["to"]
+    backend.disable()
