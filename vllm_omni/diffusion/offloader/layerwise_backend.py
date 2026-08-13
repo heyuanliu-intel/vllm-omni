@@ -15,6 +15,7 @@ from vllm_omni.platforms import current_omni_platform
 
 from .base import OffloadBackend, OffloadConfig
 from .module_collector import ModuleDiscovery
+from .offload_plan import get_offload_plan
 
 logger = init_logger(__name__)
 
@@ -330,8 +331,39 @@ class LayerWiseOffloadBackend(OffloadBackend):
         for enc in modules.encoders:
             enc.to(self.device)
 
+        # A pipeline that declares a component in ``on_demand_component_paths``
+        # loads it before use and releases it afterwards, so it owns that
+        # component's placement. Under layer-wise offloading such a pipeline has
+        # typically also built the component in host memory for exactly that
+        # reason, and moving it onto the device here contradicts a lifecycle
+        # that is already running: the resident copy is never the one used, it
+        # just holds accelerator memory for the whole request.
+        #
+        # This mirrors the decision the distributed layer-wise backend already
+        # makes in ``_register_on_demand_hook``, including why no generic
+        # post-forward hook is installed here: it would disrupt the DiT
+        # prefetch streams. ``offload_to_cpu()`` is idempotent, so confirming
+        # the placement stays correct even if something else moved the weights.
+        plan = get_offload_plan(pipeline)
+        declared = plan.on_demand_component_paths if plan is not None else frozenset()
+        staged_vaes, staged_names, resident_vaes = [], [], []
+        for vae, name in zip(modules.vaes, modules.vae_names):
+            offload_to_cpu = getattr(vae, "offload_to_cpu", None)
+            if name in declared and callable(offload_to_cpu):
+                staged_vaes.append(offload_to_cpu)
+                staged_names.append(name)
+            else:
+                resident_vaes.append(vae)
+        for offload_to_cpu in staged_vaes:
+            offload_to_cpu()
+        if staged_names:
+            logger.info(
+                "Layer-wise offloading leaves the pipeline-staged VAE(s) in host memory: %s",
+                ", ".join(staged_names),
+            )
+
         # Move VAE(s) to GPU if available
-        for vae in modules.vaes:
+        for vae in resident_vaes:
             try:
                 vae.to(self.device, non_blocking=True)
             except Exception as exc:
