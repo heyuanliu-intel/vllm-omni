@@ -12,6 +12,13 @@ class DiffusionModelMetadata:
     max_multimodal_image_inputs: int | None = None
     supports_mixed_reference_inputs: bool = False
     attention_mask_free: bool = False
+    # When true, the serving layer hands reference images to the pipeline
+    # untouched: the pipeline derives its own reference geometry and validates
+    # the reference as sent, so resizing it to the requested output size first
+    # would distort what gets encoded and hide the client's real geometry from
+    # those checks. Models that leave this false keep the legacy behavior of
+    # receiving already-resized references.
+    pipeline_owns_reference_geometry: bool = False
 
 
 QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES = 4
@@ -44,6 +51,11 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         # H3 represents alignment padding as a second packed sequence.  The
         # packed TRTLLM backend consumes cu_seqlens and isolates that padding.
         attention_mask_free=True,
+        # H3 rescales references itself (short edge to a fixed length, aspect
+        # ratio preserved) and rejects references outside its documented
+        # dimension and ratio ranges, so both steps must see the client's
+        # original geometry.
+        pipeline_owns_reference_geometry=True,
     ),
     # The modular alias is served by MiniMaxH3Pipeline and has the same
     # Ref2VA request contract. Keep admission limits in sync with it.
@@ -51,6 +63,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=9,
         supports_mixed_reference_inputs=True,
+        pipeline_owns_reference_geometry=True,
     ),
     "WanPipeline": DiffusionModelMetadata(attention_mask_free=True),
     "WanImageToVideoPipeline": DiffusionModelMetadata(attention_mask_free=True),
