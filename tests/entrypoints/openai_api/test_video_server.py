@@ -461,6 +461,40 @@ def test_i2v_video_generation_resizes_input_to_requested_dimensions(test_client,
     assert input_image.size == (96, 64)
 
 
+def test_i2v_reference_geometry_is_preserved_for_pipeline_owned_models(test_client, mocker: MockerFixture):
+    image_bytes = _make_test_image_bytes((48, 32))
+
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"fake-video",
+    )
+    # MiniMax-H3 declares pipeline_owns_reference_geometry: it rescales the
+    # reference itself and validates it as sent.
+    test_client.app.state.openai_serving_video._engine_client.model_class_name = "MiniMaxH3Pipeline"
+    response = test_client.post(
+        "/v1/videos",
+        data={
+            "prompt": "A bear playing with yarn.",
+            "width": "96",
+            "height": "64",
+        },
+        files={"input_reference": ("input.png", image_bytes, "image/png")},
+    )
+
+    assert response.status_code == 200
+    video_id = response.json()["id"]
+    _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+
+    engine = test_client.app.state.openai_serving_video._engine_client
+    input_image = engine.captured_prompt["multi_modal_data"]["image"]
+    assert isinstance(input_image, Image.Image)
+    # The client's original geometry reaches the pipeline untouched...
+    assert input_image.size == (48, 32)
+    # ...while the requested output size still travels in the sampling params.
+    sampling_params = engine.captured_sampling_params_list[0]
+    assert (sampling_params.width, sampling_params.height) == (96, 64)
+
+
 def test_i2v_extra_params_dimensions_preserve_input_image_geometry(test_client, mocker: MockerFixture):
     image_bytes = _make_test_image_bytes((48, 48))
     mocker.patch(
