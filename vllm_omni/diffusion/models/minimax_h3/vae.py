@@ -41,7 +41,14 @@ def _load_component_config(component_path: str) -> dict[str, Any]:
 def _load_remote_component(
     component_path: str,
     config: dict[str, Any],
+    *,
+    trust_remote_code: bool,
 ) -> nn.Module:
+    if not trust_remote_code:
+        raise ValueError(
+            "MiniMax H3 checkpoint VAE loading executes code declared by "
+            f"{component_path}/config.json; set trust_remote_code=True to allow it"
+        )
     auto_map = config.get("auto_map") or {}
     class_reference = auto_map.get("AutoModel")
     if not isinstance(class_reference, str):
@@ -129,12 +136,14 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         component_path: str,
         *,
         device: torch.device,
+        trust_remote_code: bool,
     ) -> None:
         super().__init__()
         self.config_dict = _load_component_config(component_path)
         self.remote = _load_remote_component(
             component_path,
             self.config_dict,
+            trust_remote_code=trust_remote_code,
         )
         # Match the reference loader contract: video VAE weights stay FP32.
         # Keyframe encoding is numerically sensitive to first casting the
@@ -316,12 +325,14 @@ class MiniMaxH3AudioVAE(nn.Module):
         component_path: str,
         *,
         device: torch.device,
+        trust_remote_code: bool,
     ) -> None:
         super().__init__()
         self.config_dict = _load_component_config(component_path)
         self.remote = _load_remote_component(
             component_path,
             self.config_dict,
+            trust_remote_code=trust_remote_code,
         )
         # The checkpoint's audio VAE contract is FP32 for both reference
         # encoding and waveform decoding.
