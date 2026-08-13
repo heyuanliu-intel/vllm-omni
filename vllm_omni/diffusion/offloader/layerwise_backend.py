@@ -286,6 +286,10 @@ class LayerWiseOffloadBackend(OffloadBackend):
         self.copy_stream = current_omni_platform.Stream()
         self._blocks: list[list[nn.Module]] = []
         self._residency: ResidencyCoordinator | None = None
+        # VAEs that got a TransientResidencyHook, so disable() can take it back off.
+        # Without this list disable() drops self._residency while the hook stays
+        # registered on the module, leaving it bound to an orphaned coordinator.
+        self._residency_vaes: list[nn.Module] = []
 
     def enable(self, pipeline: nn.Module) -> None:
         if self.enabled:
@@ -354,6 +358,7 @@ class LayerWiseOffloadBackend(OffloadBackend):
                         TransientResidencyHook._HOOK_NAME,
                         TransientResidencyHook(self._residency),
                     )
+                    self._residency_vaes.append(vae)
             except Exception as exc:
                 logger.warning("Failed to place VAE: %s", exc)
 
@@ -496,6 +501,15 @@ class LayerWiseOffloadBackend(OffloadBackend):
             for block in blocks:
                 remove_block_hook(block)
 
+        # Take the residency hook back off the VAEs before dropping the
+        # coordinator. Skipping this leaves a live hook bound to a coordinator
+        # nothing else references, and a later enable() would stack a second one.
+        for vae in self._residency_vaes:
+            registry: HookRegistry | None = getattr(vae, "_hook_registry", None)
+            if registry is not None:
+                registry.remove_hook(TransientResidencyHook._HOOK_NAME)
+
+        self._residency_vaes.clear()
         self._blocks.clear()
         self._residency = None
         self.enabled = False
