@@ -345,6 +345,49 @@ def test_serve_cli_forwards_distributed_offload_residency():
     assert engine_args["dlo_resident_layers"] == 20
 
 
+def test_serve_cli_forwards_vae_cpu_offload():
+    """Ensure the host-staged VAE opt-in reaches the diffusion stage.
+
+    The flag is only read at the far end of the chain, so a dropped hop would
+    silently fall back to the resident placement rather than fail.
+    """
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "MiniMaxAI/MiniMax-H3",
+            "--omni",
+            "--enable-cpu-offload",
+            "--vae-cpu-offload",
+        ]
+    )
+
+    explicit_kwargs = args.get_explicit_kwargs_dict()
+    engine_args = AsyncOmniEngine._create_default_diffusion_stage_cfg(explicit_kwargs)[0]["engine_args"]
+
+    assert args.vae_cpu_offload is True
+    assert engine_args["enable_cpu_offload"] is True
+    assert engine_args["vae_cpu_offload"] is True
+
+
+def test_serve_cli_vae_cpu_offload_defaults_off():
+    """Deployments that do not ask for it keep the resident VAE placement."""
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(["serve", "MiniMaxAI/MiniMax-H3", "--omni", "--enable-cpu-offload"])
+
+    explicit_kwargs = args.get_explicit_kwargs_dict()
+    engine_args = AsyncOmniEngine._create_default_diffusion_stage_cfg(explicit_kwargs)[0]["engine_args"]
+
+    assert args.vae_cpu_offload is False
+    assert engine_args["vae_cpu_offload"] is False
+
+
 def test_serve_cli_accepts_diffusion_compile_controls():
     """Ensure both compile controls reach the diffusion stage."""
     parser = TrackingArgumentParser()

@@ -695,6 +695,11 @@ class OmniDiffusionConfig:
     # - Text encoders run on GPU while DiT is on CPU
     # - DiT runs on GPU while encoders are on CPU
     enable_cpu_offload: bool = False
+    # Operator policy for the VAE(s) under model-level offload: pay host<->device
+    # transfers for the decode step instead of keeping them resident. Only takes
+    # effect for pipelines that declare the components as on-demand in their
+    # ``OffloadPlan`` and expose ``load_to_device``/``offload_to_cpu``.
+    vae_cpu_offload: bool = False
     # Layer-wise offloading (block-level offloading) parameters
     enable_layerwise_offload: bool = False
     # Distributed layer-wise offloading with H2D + AllGather overlap (RFC-1)

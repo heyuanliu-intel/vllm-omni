@@ -18,7 +18,9 @@ Model-level offloading implements mutual exclusion between DiT transformer and e
 
 - **When encoders run**: DiT transformer is offloaded to CPU
 - **When DiT runs**: Encoders are offloaded to CPU, if more than one dit models, only one loaded on GPU, others get offloaded to CPU.
-- **VAE**: Stays resident on GPU
+- **VAE**: Stays resident on GPU by default. Pipelines that stage their VAEs
+  themselves can opt into host-memory placement with `--vae-cpu-offload`
+  (see [Host-staged VAEs](#host-staged-vaes-vae_cpu_offload)).
 
 Before each module's forward pass, the hook automatically moves it to GPU while offloading the other module group to CPU. Transfers use pinned memory for speed.
 
@@ -57,15 +59,16 @@ class MyPipeline(nn.Module, SupportsComponentDiscovery):
         self.transformer = ...     # DiT — stays on GPU during denoising
         self.text_encoder = ...    # Encoder — offloaded to CPU during denoising
         self.vision_model = ...    # Encoder — offloaded to CPU during denoising
-        self.vae = ...             # VAE — always on GPU
+        self.vae = ...             # VAE — GPU-resident unless host-staged
 ```
 
 - `_dit_modules`: attribute names of denoising submodules (kept on GPU
   during the diffusion loop).
 - `_encoder_modules`: attribute names of encoder/vision submodules
   (offloaded to CPU during the diffusion loop).
-- `_vae_modules`: attribute names of VAE(s) (always kept on GPU, not
-  part of the mutual exclusion hooks).
+- `_vae_modules`: attribute names of VAE(s). Never part of the mutual
+  exclusion hooks; GPU-resident unless the pipeline opts into
+  [host staging](#host-staged-vaes-vae_cpu_offload).
 - `_resident_modules`: attribute names of small submodules that must
   stay on GPU during layerwise offloading (e.g. embedders, connectors).
   Optional — defaults to `[]`.
@@ -75,6 +78,45 @@ All attribute names support dotted paths for nested submodules
 
 Both DiT and encoder lists are needed because the offload hooks use
 mutual exclusion: when one group runs, the other moves to CPU.
+
+### Host-staged VAEs (`vae_cpu_offload`)
+
+By default model-level offloading keeps VAEs GPU-resident, because the mutual
+exclusion hooks only swap DiT against encoders. For pipelines that already load
+and release their VAEs around each use, holding those weights on the
+accelerator for the whole request is pure overhead. `--vae-cpu-offload` lets
+such a pipeline park its VAEs in host memory instead.
+
+**Python API:**
+```python
+m = Omni(model="MiniMaxAI/MiniMax-H3", enable_cpu_offload=True, vae_cpu_offload=True)
+```
+
+**CLI:**
+```bash
+vllm serve MiniMaxAI/MiniMax-H3 --omni --enable-cpu-offload --vae-cpu-offload
+```
+
+The flag defaults to `false`, so existing deployments keep the resident
+placement. It takes effect only when **all** of the following hold:
+
+1. Model-level offloading is on (`--enable-cpu-offload`). The flag is ignored
+   under layerwise and distributed layerwise offloading, which own their own
+   component lifecycle.
+2. The pipeline declares the component in
+   `OffloadPlan.on_demand_component_paths` — a statement that it stages the
+   component itself.
+3. The component exposes both `load_to_device()` and `offload_to_cpu()`.
+
+If any condition fails the VAE stays resident, which is the previous behavior:
+an unsupported pipeline degrades instead of failing later inside encode/decode.
+
+**Tradeoff**: this trades accelerator memory for host↔device transfers. Each
+VAE use pays a load and an offload, so it pays off when the VAE is large
+relative to how often it runs (encoding reference inputs, decoding the final
+latents) and costs throughput when the VAE runs frequently.
+
+Currently supported by: MiniMax-H3 (`video_vae`, `audio_vae`).
 
 ### Limitations
 - Cold start latency increases
@@ -293,6 +335,20 @@ class MyPipeline(nn.Module):
 When not declared, the offloader falls back to `_layerwise_offload_blocks_attrs`
 and heuristic attribute search.  This is backward-compatible — existing models
 work without any changes.
+
+Most `OffloadPlan` fields describe distributed layer-wise topology and are read
+only by that backend. `on_demand_component_paths` is the exception: it states a
+property of the *pipeline* — that it loads a component before use and releases
+it afterwards — so **every** offload backend may read it. Model-level offloading
+uses it as one of the three gates behind
+[`vae_cpu_offload`](#host-staged-vaes-vae_cpu_offload); declaring a path here
+does not by itself change placement.
+
+```python
+_offload_plan = OffloadPlan(
+    on_demand_component_paths=frozenset({"text_encoder", "video_vae", "audio_vae"}),
+)
+```
 
 ### DP Multi-concurrency
 

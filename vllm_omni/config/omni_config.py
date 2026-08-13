@@ -572,6 +572,7 @@ class _DiffusionConfigProjection:
     max_cpu_loras: int | None = None
     output_type: str = "pil"
     enable_cpu_offload: bool = False
+    vae_cpu_offload: bool = False
     enable_layerwise_offload: bool = False
     enable_distributed_layerwise_offload: bool = False
     dlo_use_allgather: bool = True

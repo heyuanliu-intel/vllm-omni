@@ -1068,6 +1068,25 @@ def test_diffusion_config_field_classification_covers_current_fields():
     assert "prompt_file_path" in omni_config_module._DIFFUSION_RUNTIME_CONFIG_FIELDS
 
 
+def test_structured_engine_overrides_carry_vae_cpu_offload():
+    """The structured/deploy path must forward the host-staged VAE opt-in.
+
+    Field-set introspection only proves the field exists; this drives an actual
+    value through the override selection and the projection so a dropped hop
+    cannot silently fall back to ``False``.
+    """
+    overrides = omni_config_module._DiffusionEngineOverrides.from_engine(
+        {"enable_cpu_offload": True, "vae_cpu_offload": True}
+    )
+
+    assert overrides.to_kwargs()["vae_cpu_offload"] is True
+
+    projection = omni_config_module._DiffusionConfigProjection.from_kwargs(**overrides.to_kwargs())
+
+    assert projection.vae_cpu_offload is True
+    assert omni_config_module._DiffusionConfigProjection().vae_cpu_offload is False
+
+
 def test_diffusion_config_projection_keeps_mapping_quantization_config_serializable():
     quantization_config = {
         "method": "example_quant",
