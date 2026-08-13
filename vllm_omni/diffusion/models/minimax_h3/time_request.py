@@ -95,10 +95,6 @@ def minimax_h3_align_frame_count(frame_count: int) -> int:
     return MINIMAX_H3_SHAPE_PLANNER.align_frame_count(frame_count)
 
 
-def minimax_h3_frame_count_from_video_latent_t(out_t: int) -> int:
-    return MINIMAX_H3_SHAPE_PLANNER.frame_count_from_video_latent_t(out_t)
-
-
 def minimax_h3_time_shift_sigmas(
     *,
     num_steps: int = 50,

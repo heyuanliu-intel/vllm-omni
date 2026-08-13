@@ -70,21 +70,6 @@ def minimax_h3_unpatchify_video_tokens(
     return latent.reshape(-1, channel, t * pt, h * ph, w * pw).contiguous()
 
 
-def minimax_h3_pack_audio_latent(latent: torch.Tensor) -> torch.Tensor:
-    """Pack audio VAE latent [audio_channel, latent_dim, T] into rows."""
-
-    _rank(latent, "audio latent", 3)
-    audio_channel, latent_dim, steps = (int(dim) for dim in latent.shape)
-    return (
-        latent.permute(0, 2, 1)
-        .reshape(
-            audio_channel * steps,
-            latent_dim,
-        )
-        .contiguous()
-    )
-
-
 def minimax_h3_unpack_audio_tokens(
     rows: torch.Tensor,
     *,
@@ -107,7 +92,6 @@ def minimax_h3_unpack_audio_tokens(
 
 
 __all__ = [
-    "minimax_h3_pack_audio_latent",
     "minimax_h3_patchify_video_latent",
     "minimax_h3_unpack_audio_tokens",
     "minimax_h3_unpatchify_video_tokens",

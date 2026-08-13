@@ -55,15 +55,6 @@ def get_tp_world_size() -> int:
         return 1
 
 
-def get_tp_rank() -> int:
-    try:
-        from vllm.distributed import get_tensor_model_parallel_rank
-
-        return get_tensor_model_parallel_rank()
-    except Exception:
-        return 0
-
-
 class AttentionBackendEnum(enum.Enum):
     """Subset of SGLang's enum. The H3 DiT only ever compares against FA."""
 
@@ -173,7 +164,6 @@ __all__ = [
     "RowParallelLinear",
     "get_attn_backend",
     "get_sp_group",
-    "get_tp_rank",
     "get_tp_world_size",
     "get_ulysses_parallel_rank",
     "get_ulysses_parallel_world_size",

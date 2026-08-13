@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import math
-from typing import Any
 
 import torch
 
@@ -29,20 +28,6 @@ def _validate_sigma(value: float, name: str) -> float:
         raise ValueError(f"{name} must be finite")
     if sigma < 0.0:
         raise ValueError(f"{name} must be non-negative")
-    return sigma
-
-
-def _validate_timestep_sigma_pair(
-    timestep: torch.Tensor,
-    sigma_curr: float,
-    name: str,
-) -> float:
-    _validate_unit_timestep(timestep, f"{name}_timestep")
-    sigma = _validate_sigma(sigma_curr, f"{name}_sigma_curr")
-    expected = 1.0 - timestep.detach().to(dtype=torch.float32)
-    actual = torch.full_like(expected, sigma)
-    if not torch.allclose(actual, expected, rtol=1e-5, atol=1e-5):
-        raise ValueError(f"{name}_sigma_curr must equal 1 - {name}_timestep")
     return sigma
 
 
@@ -102,78 +87,7 @@ def minimax_h3_euler_eta0_step(
     return out
 
 
-class MiniMaxH3EulerAncestralEta0SchedulerAdapter:
-    def __init__(self, **config: Any) -> None:
-        if config:
-            raise ValueError(f"{type(self).__name__} does not accept config fields: {sorted(config)}")
-
-    def set_shift(self, _flow_shift: float) -> None:
-        """Ignore flow shift, matching the previous loader-specific path."""
-
-    def step_denoising(
-        self,
-        *,
-        input_visual_latent: torch.Tensor,
-        input_audio_latent: torch.Tensor,
-        timestep: torch.Tensor,
-        noise_pred_visual: torch.Tensor,
-        noise_pred_audio: torch.Tensor,
-        sigma_curr: float,
-        sigma_next: float,
-        video_timestep: torch.Tensor | None = None,
-        audio_timestep: torch.Tensor | None = None,
-        video_sigma_curr: float | None = None,
-        video_sigma_next: float | None = None,
-        audio_sigma_curr: float | None = None,
-        audio_sigma_next: float | None = None,
-    ) -> dict[str, torch.Tensor]:
-        visual_timestep = timestep if video_timestep is None else video_timestep
-        audio_timestep = timestep if audio_timestep is None else audio_timestep
-        visual_sigma_curr = sigma_curr if video_sigma_curr is None else video_sigma_curr
-        visual_sigma_next = sigma_next if video_sigma_next is None else video_sigma_next
-        audio_sigma_curr = sigma_curr if audio_sigma_curr is None else audio_sigma_curr
-        audio_sigma_next = sigma_next if audio_sigma_next is None else audio_sigma_next
-        visual_sigma_curr = _validate_timestep_sigma_pair(
-            visual_timestep,
-            visual_sigma_curr,
-            "video",
-        )
-        audio_sigma_curr = _validate_timestep_sigma_pair(
-            audio_timestep,
-            audio_sigma_curr,
-            "audio",
-        )
-
-        denoised_visual = minimax_h3_rf_v_to_x0(
-            input_visual_latent,
-            noise_pred_visual,
-            visual_timestep,
-        )
-        denoised_audio = minimax_h3_rf_v_to_x0(
-            input_audio_latent,
-            noise_pred_audio,
-            audio_timestep,
-        )
-        return {
-            "output_visual_latent": minimax_h3_euler_eta0_step(
-                input_visual_latent,
-                denoised_visual,
-                sigma_curr=visual_sigma_curr,
-                sigma_next=visual_sigma_next,
-            ),
-            "output_audio_latent": minimax_h3_euler_eta0_step(
-                input_audio_latent,
-                denoised_audio,
-                sigma_curr=audio_sigma_curr,
-                sigma_next=audio_sigma_next,
-            ),
-        }
-
-
-EntryClass = MiniMaxH3EulerAncestralEta0SchedulerAdapter
-
 __all__ = [
-    "MiniMaxH3EulerAncestralEta0SchedulerAdapter",
     "minimax_h3_euler_eta0_step",
     "minimax_h3_rf_v_to_x0",
 ]
