@@ -47,11 +47,23 @@ def _load_component_config(component_path: str) -> dict[str, Any]:
 def _load_remote_component(
     component_path: str,
     config: dict[str, Any],
+    *,
+    trust_remote_code: bool,
 ) -> nn.Module:
     auto_map = config.get("auto_map") or {}
     class_reference = auto_map.get("AutoModel")
     if not isinstance(class_reference, str):
         raise ValueError(f"{component_path}/config.json must define auto_map.AutoModel")
+    if not trust_remote_code:
+        raise ValueError(
+            f"Loading {component_path} executes the modeling code shipped with "
+            f"the checkpoint (auto_map.AutoModel = {class_reference}). Pass "
+            "--trust-remote-code (or trust_remote_code=True) to allow it."
+        )
+    # ``trust_remote_code`` is checked here rather than forwarded to
+    # ``get_class_from_dynamic_module``: that helper takes no such argument and
+    # would silently absorb it into ``**kwargs``, so forwarding it would read
+    # like a gate while executing the remote code unconditionally.
     component_cls = get_class_from_dynamic_module(
         class_reference,
         component_path,
@@ -116,6 +128,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         *,
         device: torch.device,
         load_device: torch.device | None = None,
+        trust_remote_code: bool = False,
     ) -> None:
         super().__init__()
         self._device_target = device
@@ -123,6 +136,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         self.remote = _load_remote_component(
             component_path,
             self.config_dict,
+            trust_remote_code=trust_remote_code,
         )
         # Match the reference loader contract: video VAE weights stay FP32.
         # Keyframe encoding is numerically sensitive to first casting the
@@ -383,6 +397,7 @@ class MiniMaxH3AudioVAE(nn.Module):
         *,
         device: torch.device,
         load_device: torch.device | None = None,
+        trust_remote_code: bool = False,
     ) -> None:
         super().__init__()
         self._device_target = device
@@ -390,6 +405,7 @@ class MiniMaxH3AudioVAE(nn.Module):
         self.remote = _load_remote_component(
             component_path,
             self.config_dict,
+            trust_remote_code=trust_remote_code,
         )
         # The checkpoint's audio VAE contract is FP32 for both reference
         # encoding and waveform decoding.
