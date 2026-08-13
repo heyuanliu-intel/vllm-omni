@@ -42,6 +42,11 @@ from vllm.logger import init_logger
 MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER = 50
 MINIMAX_H3_QWEN3VL_HIDDEN_DIM = 5120
 
+# Every parameter constructed by the retained encoder has a checkpoint source.
+# Keep exceptions explicit so a future architecture change cannot silently
+# leave a randomly initialized parameter in the model.
+_ALLOWED_MISSING_ENCODER_PARAMETERS: frozenset[str] = frozenset()
+
 logger = init_logger(__name__)
 
 
@@ -1027,17 +1032,22 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
                 param_name, shard_id = mapped
                 param = params.get(param_name)
                 if param is None:
-                    logger.warning("MiniMax H3 text encoder weight %s has no target parameter", name)
-                    continue
+                    raise RuntimeError(
+                        "MiniMax H3 text encoder checkpoint weight "
+                        f"{name!r} maps to missing target parameter {param_name!r}"
+                    )
                 weight_loader = getattr(param, "weight_loader", _default_weight_loader)
                 weight_loader(param, tensor, shard_id)
                 loaded.add(param_name)
-        missing = sorted(set(params) - loaded)
-        if missing:
-            logger.warning(
-                "MiniMax H3 text encoder weights not loaded (retained-layer subset): %d params, e.g. %s",
-                len(missing),
-                missing[:5],
+        missing = set(params) - loaded
+        unexpected_missing = sorted(
+            missing - _ALLOWED_MISSING_ENCODER_PARAMETERS
+        )
+        if unexpected_missing:
+            raise RuntimeError(
+                "MiniMax H3 text encoder checkpoint did not initialize "
+                f"{len(unexpected_missing)} required parameter(s), e.g. "
+                f"{unexpected_missing[:5]}"
             )
 
     def load_to_device(self) -> None:
