@@ -94,6 +94,15 @@ class GroupCoordinator:
     cpu_group: ProcessGroup  # group for CPU communication
     device_group: ProcessGroup  # group for device communication
 
+    # One flat all-gather landing buffer per (dtype, device); see
+    # `_all_gather_buffer`. Declared here rather than assigned in `__init__`
+    # because `PipelineGroupCoordinator` re-implements `__init__` without
+    # calling `super().__init__()` while still inheriting `all_gather`, so
+    # per-instance state created only in the base constructor would be missing
+    # there. The dict is built lazily per instance -- this class attribute is
+    # only the `None` sentinel and is never mutated.
+    _all_gather_buffers: dict[tuple[torch.dtype, torch.device], torch.Tensor] | None = None
+
     def __init__(
         self,
         group_ranks: list[list[int]],
@@ -122,6 +131,50 @@ class GroupCoordinator:
         assert self.device_group is not None
 
         self.device = current_omni_platform.get_torch_device(local_rank)
+
+    def _all_gather_buffer(self, numel: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        """Return a stable, reused landing buffer of `numel` elements.
+
+        Allocating a fresh output per call means the collective sees a new
+        device address whenever the caching allocator has returned segments to
+        the driver, which any `empty_cache()` on the request path does. Measured
+        on XPU with an otherwise idle service, that came with ~1.16 GB per
+        request of linear growth outside PyTorch's own accounting
+        (`card_used - memory_reserved`), invisible to `memory_allocated` and
+        `memory_reserved`; suppressing those `empty_cache()` calls removed both
+        the new addresses and the growth. The registrations a communication
+        library keeps for the memory it is handed are the likely mechanism --
+        an inference from that intervention, not something read out of a driver
+        registry. All-gather is one share of that total, not all of it.
+
+        The same reasoning already drives the pre-allocated shard buffers in
+        `offloader/distributed_layerwise_backend.py`, whose docstring puts it as
+        "the same device address is reused for every layer's AllGather so HCCL
+        can reuse its internal communication buffers".
+
+        One flat buffer per (dtype, device) is kept and grown monotonically, so
+        the residency is bounded by the largest gather seen rather than by the
+        number of distinct shapes. Note what that guarantees: once a
+        dtype/device has seen its largest gather, every gather that does not
+        exceed it reuses one address. A new record high still reallocates once,
+        so the address count is bounded by the number of record highs rather
+        than fixed at one.
+
+        The slot is shared, so this assumes the coordinator is driven from a
+        single execution stream -- which is what the diffusion worker does
+        today: forwards run on one busy-loop thread and the async output thread
+        issues no collectives. Concurrent callers on separate streams would need
+        per-stream landings or an event, not just this dict.
+        """
+        buffers = self._all_gather_buffers
+        if buffers is None:
+            buffers = self._all_gather_buffers = {}
+        key = (dtype, device)
+        buffer = buffers.get(key)
+        if buffer is None or buffer.numel() < numel:
+            buffer = torch.empty(numel, dtype=dtype, device=device)
+            buffers[key] = buffer
+        return buffer[:numel]
 
     @property
     def first_rank(self):
@@ -218,9 +271,14 @@ class GroupCoordinator:
         # Allocate output tensor.
         input_size = list(input_.size())
         input_size[0] *= world_size
-        output_tensor = torch.empty(input_size, dtype=input_.dtype, device=input_.device)
-        # All-gather.
-        torch.distributed.all_gather_into_tensor(output_tensor, input_.contiguous(), group=group)
+        # Land the collective in a reused buffer so its device address stays
+        # stable across requests (see `_all_gather_buffer`), then hand the
+        # caller its own tensor. The copy keeps the previous contract -- callers
+        # own the result and may hold or mutate it -- and the copy's memory is
+        # never seen by the communication library, so it costs no registration.
+        landing = self._all_gather_buffer(input_.numel() * world_size, input_.dtype, input_.device).view(input_size)
+        torch.distributed.all_gather_into_tensor(landing, input_.contiguous(), group=group)
+        output_tensor = landing.clone()
         if dim != 0:
             input_size[0] //= world_size
             output_tensor = output_tensor.reshape(
@@ -614,6 +672,8 @@ class GroupCoordinator:
         if self.cpu_group is not None:
             torch.distributed.destroy_process_group(self.cpu_group)
             self.cpu_group = None
+        # Drop the all-gather landing buffers with the group that used them.
+        self._all_gather_buffers = None
 
 
 class PipelineGroupCoordinator(GroupCoordinator):
