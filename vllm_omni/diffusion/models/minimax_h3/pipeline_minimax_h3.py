@@ -45,6 +45,7 @@ from vllm_omni.diffusion.models.interface import (
 )
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.offloader import OffloadPlan
+from vllm_omni.diffusion.offloader.sequential_backend import evict_module_to_host
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
 )
@@ -1173,6 +1174,103 @@ class MiniMaxH3Pipeline(
             if staged:
                 component.offload_to_cpu()
 
+    def _vae_stage_offload_active(self) -> bool:
+        """Whether the VAE stage should run with the DiT's HBM reclaimed.
+
+        The exclusions are exactly the two layerwise modes, because their
+        block-streaming owns the DiT's residency. They are spelled out instead
+        of reusing ``_uses_manual_component_offload`` on purpose: that
+        predicate answers "are components staged manually?", and any future
+        contributor to it (e.g. host-staged VAEs) would silently disable this
+        eviction even though the DiT is still fully resident in their mode.
+        """
+        od_config = getattr(self, "od_config", None)
+        return bool(getattr(od_config, "enable_cpu_offload", False)) and not (
+            bool(getattr(od_config, "enable_layerwise_offload", False))
+            or bool(getattr(od_config, "enable_distributed_layerwise_offload", False))
+        )
+
+    def _evict_resident_dits_for_vae(self) -> None:
+        """Take resident DiT modules off the device before a VAE stage runs.
+
+        Model-level CPU offload swaps the DiT against the *encoders* only
+        (``apply_sequential_offload`` pairs those two), so the DiT is still
+        resident when decoding starts right after denoising. The VAE then has to
+        allocate its output on top of a card that already holds the DiT: on
+        MiniMax-H3 at TP=4/SP=2 that allocation is 1.43 GiB and it does not fit.
+
+        ``evict_module_to_host`` moves the module's registered parameters and
+        buffers; runtime caches held in plain containers (e.g. Cache-DiT's
+        residual cache) are not registered state and are out of scope here.
+
+        There is deliberately no restore. The sequential hook's ``pre_forward``
+        already loads the DiT back (parameters and buffers) on its next
+        forward, so the next denoise pays the H2D this code would otherwise pay
+        -- and ``decode`` moves its outputs off the device before returning, so
+        that reload never overlaps with a decoded output (see
+        ``_offload_stage_output``). A DiT on the host is also the state every
+        request's encoder stage produces anyway. ``evict_module_to_host``
+        refuses modules without a hook, so nothing can be stranded.
+        """
+        if not self._vae_stage_offload_active():
+            return
+        evicted = 0
+        freed_bytes = 0
+        for name in self._dit_modules:
+            dit = getattr(self, name, None)
+            if dit is None:
+                continue
+            resident_bytes = sum(p.numel() * p.element_size() for p in dit.parameters() if p.device.type != "cpu")
+            if evict_module_to_host(dit):
+                if resident_bytes:
+                    evicted += 1
+                    freed_bytes += resident_bytes
+            elif resident_bytes:
+                # The dangerous silent path: the DiT is on the card but nothing
+                # can reload it later, so it must stay -- and the decode may OOM
+                # exactly as it did without this fix. Say so.
+                logger.warning(
+                    "DiT %r is resident but carries no sequential offload hook; leaving it on the device", name
+                )
+        if evicted:
+            logger.info(
+                "Evicted %d DiT module(s) (%.2f GiB) ahead of the VAE stage", evicted, freed_bytes / 1024**3
+            )
+
+    @staticmethod
+    def _is_output_owner_rank() -> bool:
+        """Whether this rank's DiffusionOutput is the one the executor returns.
+
+        Every rank executes the pipeline (``exec_all_ranks=True``) but the
+        executor replies from ``unique_reply_rank=0`` only; the other ranks'
+        outputs are never consumed. Single-process runs own their output.
+        """
+        return not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0
+
+    def _offload_stage_output(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Get a decoded output off the device before the DiT can come back.
+
+        With the DiT evicted for the VAE stage, its reload happens on its next
+        forward -- which, for ``num_outputs_per_prompt > 1``, is the *next
+        seed's* denoise inside the same request. An output still resident at
+        that point would recreate exactly the overlap the eviction removed, so
+        every decoded output leaves the device before ``decode`` returns.
+
+        Only the reply rank actually copies: its blocking D2H is the transfer
+        the IPC layer would otherwise do at request end, pulled forward -- a
+        deliberate trade of this CPU-offload path, since it forgoes the default
+        async D2H/next-forward overlap (``_return_result``'s side stream). The
+        other ranks' outputs are never consumed, so paying a full host copy on
+        each of them would only multiply host RAM by the world size; they drop
+        the device storage and keep a shape/dtype-preserving meta placeholder
+        for the ``torch.cat`` at the end of the seed loop.
+        """
+        if not self._vae_stage_offload_active():
+            return tensor
+        if self._is_output_owner_rank():
+            return tensor.cpu()
+        return torch.empty(tensor.shape, dtype=tensor.dtype, device="meta")
+
     def _encode_visual_condition(
         self,
         image: Image.Image,
@@ -1599,6 +1697,7 @@ class MiniMaxH3Pipeline(
         height: int,
         width: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        self._evict_resident_dits_for_vae()
         with self._component_on_device(self.video_vae):
             with current_omni_platform.create_autocast_context(
                 device_type=self.device.type,
@@ -1606,9 +1705,10 @@ class MiniMaxH3Pipeline(
                 enabled=True,
             ):
                 video = self.video_vae.decode_latent(video_latent)
-        video = video[..., :height, :width].contiguous()
+        video = self._offload_stage_output(video[..., :height, :width].contiguous())
         with self._component_on_device(self.audio_vae):
             audio = self.audio_vae.decode_latent(audio_latent)
+        audio = self._offload_stage_output(audio)
         return video, audio
 
     @torch.no_grad()

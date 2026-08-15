@@ -150,6 +150,18 @@ All models running in request-mode (`step_execution=False`, the default) automat
 
 Other models with `step_execution=False` are also supported but not yet verified.
 
+**Narrow exception -- MiniMax-H3 with model-level CPU offload**: with
+`enable_cpu_offload=True` and neither layerwise mode, the H3 pipeline evicts the
+DiT for the VAE decode and moves each decoded output to the host *inside*
+`decode()` (owner rank only; see `_offload_stage_output` in
+`pipeline_minimax_h3.py`). The async envelope and SHM packing still run, but the
+main D2H has already happened synchronously before `COMPUTE_DONE`, so the
+"D2H overlaps the next forward" benefit does not apply on this path. This is a
+deliberate trade: an output still resident on the device would overlap with the
+DiT reload on the next seed's denoise (`num_outputs_per_prompt > 1`) and
+recreate the decode OOM this eviction exists to fix. Do not "restore async" for
+this configuration without re-solving that overlap.
+
 ### Not Yet Supported (step-mode, `step_execution=True`)
 
 When `step_execution=True` (or `streaming_output=True`, which auto-enables step-mode), models use `execute_stepwise` instead of `execute_model`, which is not in the async Path 1 whitelist. Async output is not applicable.

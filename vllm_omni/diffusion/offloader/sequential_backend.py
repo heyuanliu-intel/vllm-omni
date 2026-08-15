@@ -171,6 +171,45 @@ def apply_sequential_offload(
         logger.debug("Registered offload hook for %s", enc.__class__.__name__)
 
 
+def evict_module_to_host(module: nn.Module) -> bool:
+    """Move a hook-managed module's weights to the host, mid-stage.
+
+    Public entry point for pipelines that need a module's HBM back before a
+    stage that the swap hooks do not cover (e.g. a VAE decode running while the
+    DiT is still resident). The module must carry a ``SequentialOffloadHook``:
+    the hook's ``pre_forward`` is what loads the module back (parameters and
+    buffers) on its next forward, so evicting an unhooked module would strand
+    it on the host -- in that case nothing moves and this returns False.
+
+    Returns True when the module's weights are on the host with a hook owning
+    the reload -- whether this call moved them or they were already there.
+
+    Unlike the hook's own swap path this deliberately does not call
+    ``empty_cache()``: a mid-stage eviction frees blocks precisely so the same
+    request's next allocation can be served from the caching allocator.
+    """
+    registry: HookRegistry | None = getattr(module, "_hook_registry", None)
+    hook = registry.get_hook(SequentialOffloadHook._HOOK_NAME) if registry is not None else None
+    if hook is None or not isinstance(hook, SequentialOffloadHook):
+        return False
+    try:
+        param = next(module.parameters())
+    except StopIteration:
+        return False
+    if param.device.type == "cpu":
+        return True
+    # Same copy policy as SequentialOffloadHook._to_cpu: blocking on XPU, where
+    # non-blocking D2H can race the allocator's cache eviction.
+    non_blocking = not hook.use_hsdp and not current_omni_platform.is_xpu()
+    SequentialOffloadHook._move_params(
+        module,
+        torch.device("cpu"),
+        non_blocking=non_blocking,
+        pin_memory=hook.pin_memory,
+    )
+    return True
+
+
 def remove_sequential_offload(modules: list[nn.Module]) -> None:
     """Remove sequential offloading hooks from modules.
 
