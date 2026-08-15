@@ -78,12 +78,23 @@ class PinnedModuleStager:
         # The module has completed on the compute stream. Synchronize once at
         # the stage boundary, then release HBM by rebinding to the unchanged
         # host masters. No device-to-host transfer is necessary.
+        #
+        # The trailing ``empty_cache`` is skipped on XPU. Returning the segments
+        # to the driver is not required for the freed HBM to be reusable -- the
+        # caching allocator already hands those blocks to the next allocation --
+        # but on XPU it churns the addresses of the collective receive buffers
+        # allocated after it, and the XPU collective backend registers a
+        # non-reclaimable driver resource per distinct receive-buffer address,
+        # so device memory outside the PyTorch pool was observed growing across
+        # requests. The PR body carries the single-variable A/B, its sample size
+        # and its topology.
         current_omni_platform.synchronize()
         for target, master in self._entries:
             set_tensor_storage(target, master)
         self._device_tensors.clear()
         self.loaded = False
-        current_omni_platform.empty_cache()
+        if not current_omni_platform.is_xpu():
+            current_omni_platform.empty_cache()
 
 
 __all__ = ["PinnedModuleStager"]
