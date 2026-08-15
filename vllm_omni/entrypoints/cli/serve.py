@@ -704,6 +704,17 @@ class OmniServeCommand(CLISubcommand):
             help="Enable layerwise (blockwise) offloading on DiT modules.",
         )
         omni_config_group.add_argument(
+            "--layerwise-offload-components",
+            type=str,
+            default=None,
+            help=(
+                "Comma list drawn from {dit, text_encoder, vae} naming the component "
+                "families layer-wise offloading may manage; a family left out stays "
+                "fully device-resident. Default: all of them. Only plain layer-wise "
+                "offloading consumes this; distributed layer-wise does not."
+            ),
+        )
+        omni_config_group.add_argument(
             "--enable-distributed-layerwise-offload",
             action="store_true",
             help="Enable distributed layerwise offloading with H2D + AllGather overlap. "

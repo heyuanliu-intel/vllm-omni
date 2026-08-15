@@ -157,7 +157,7 @@ works for these models too -- each component declares its own block container vi
 
 Layerwise offloading keeps only one transformer block on GPU at a time.
 
-As each block completes, the next block is prefetched to GPU while the current block is freed. The pre and forward hooks utilized by layerwise offloading apply a separate CUDA stream (`copy_stream`) to overlap weight transfer with computation, and retain flattened tensors in pinned CPU memory for block parameters re-materialization. Encoders, VAE, and non-block DiT modules (embeddings, norms) always stay on GPU.
+As each block completes, the next block is prefetched to GPU while the current block is freed. The pre and forward hooks utilized by layerwise offloading apply a separate CUDA stream (`copy_stream`) to overlap weight transfer with computation, and retain flattened tensors in pinned CPU memory for block parameters re-materialization. Non-block DiT modules (embeddings, norms) stay on GPU. Encoders and VAEs are managed too when the pipeline declares the capability: an encoder that declares `OffloadPlan.encoder_block_attrs` has its block stacks paged the same way, and a VAE the pipeline declares in `on_demand_component_paths` is host-staged between uses; components without a declared capability stay on GPU.
 
 **Execution Flow:**
 
@@ -193,6 +193,33 @@ vllm serve Wan-AI/Wan2.2-T2V-A14B-Diffusers --omni --enable-layerwise-offload
 # Or image-to-video
 vllm serve Wan-AI/Wan2.2-I2V-A14B-Diffusers --omni --enable-layerwise-offload
 ```
+
+### Selecting Which Component Families Are Managed
+
+`--layerwise-offload-components` narrows which component families plain
+layer-wise offloading may manage, as a comma list drawn from `dit`,
+`text_encoder`, and `vae`. A family left out stays fully device-resident for
+the whole request lifecycle. Omitting the option selects every family (the
+default behavior above).
+
+The load-bearing use is excluding `dit`: when the DiT fits whole on the device
+but the encoders and VAEs do not, streaming the DiT would multiply the
+per-step denoise time, so run with only the other families managed:
+
+```bash
+vllm serve <model> --omni --enable-layerwise-offload \
+  --layerwise-offload-components text_encoder,vae
+```
+
+Constraints:
+
+- Unknown or empty selections fail config validation.
+- Only plain layer-wise offloading consumes the selection. Distributed
+  layer-wise offloading ignores it (a warning is logged), and model-level CPU
+  offload has its own policy.
+- Selecting `text_encoder` or `vae` manages them only on pipelines that
+  declare the capability (`OffloadPlan.encoder_block_attrs` /
+  `on_demand_component_paths`); components without it stay on GPU either way.
 
 ### To Support a Model
 
