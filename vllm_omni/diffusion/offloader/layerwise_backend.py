@@ -465,9 +465,17 @@ class LayerWiseOffloadBackend(OffloadBackend):
         # the pipeline declares as on-demand is parked in host memory and left to
         # the pipeline's own load/release lifecycle, and everything else is made
         # resident.
+        # The selection names which component families this backend may manage;
+        # a family left out stays fully device-resident, whatever streaming or
+        # staging support its tree would otherwise apply.
+        selection = self.config.layerwise_components
+
         plan = get_offload_plan(pipeline)
         declared_on_demand = plan.on_demand_component_paths if plan is not None else frozenset()
         for enc, enc_name in zip(modules.encoders, modules.encoder_names):
+            if "text_encoder" not in selection:
+                enc.to(self.device)
+                continue
             if stream_declared_encoder_blocks(enc, enc_name, plan, self.device, pin_memory=self.config.pin_cpu_memory):
                 self._streamed_encoders.append(enc)
             offload_to_cpu = getattr(enc, "offload_to_cpu", None)
@@ -493,7 +501,7 @@ class LayerWiseOffloadBackend(OffloadBackend):
         staged_vaes, staged_names, resident_vaes = [], [], []
         for vae, name in zip(modules.vaes, modules.vae_names):
             offload_to_cpu = getattr(vae, "offload_to_cpu", None)
-            if name in declared and callable(offload_to_cpu):
+            if "vae" in selection and name in declared and callable(offload_to_cpu):
                 staged_vaes.append(offload_to_cpu)
                 staged_names.append(name)
             else:
@@ -519,6 +527,21 @@ class LayerWiseOffloadBackend(OffloadBackend):
                 module.to(self.device)
             except Exception as exc:
                 logger.debug("Failed to move resident module %s to GPU: %s", name, exc)
+
+        # Excluding "dit" is the load-bearing case: it yields the topology where
+        # the DiT fits whole on the device and only the other components are
+        # streamed/staged, instead of paying the per-block streaming cost on the
+        # component that dominates step time.
+        if "dit" not in selection:
+            for dit_name, dit_module in zip(modules.dit_names, modules.dits):
+                dit_module.to(self.device)
+            logger.info(
+                "Layer-wise offload components=%s: DiT module(s) %s stay fully device-resident",
+                sorted(selection),
+                modules.dit_names,
+            )
+            self.enabled = True
+            return
 
         logger.info("Applying layer-wise offloading on %s", modules.dit_names)
 

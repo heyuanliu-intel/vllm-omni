@@ -380,6 +380,7 @@ class StageDeployConfig:
     enable_cpu_offload: bool | None = None
     vae_cpu_offload: bool | None = None
     enable_layerwise_offload: bool | None = None
+    layerwise_offload_components: str | None = None
 
     enable_distributed_layerwise_offload: bool | None = None
     dlo_use_allgather: bool | None = None

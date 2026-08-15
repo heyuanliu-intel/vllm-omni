@@ -712,13 +712,9 @@ class MiniMaxH3Pipeline(
         # The VAEs must be *constructed* wherever they are going to live: building
         # them on the accelerator and only later declining to move them there
         # would leave the weights resident anyway, and would skip the pinned
-        # staging path in the adapters. Use the same policy predicate the offload
-        # backend uses so the two cannot drift apart.
-        stage_components = bool(
-            od_config.enable_layerwise_offload
-            or getattr(od_config, "enable_distributed_layerwise_offload", False)
-            or model_level_vae_host_staging_requested(od_config)
-        )
+        # staging path in the adapters. The per-use scope and this construction
+        # site share one policy resolver so the two cannot drift apart.
+        stage_components = self._vae_staging_active()
         component_load_device = torch.device("cpu") if stage_components else self.device
         self.video_vae = MiniMaxH3VideoVAE(
             os.path.join(model_path, "video_vae"),
@@ -1140,16 +1136,14 @@ class MiniMaxH3Pipeline(
         input_ids: torch.Tensor,
         vision_kwargs: dict[str, torch.Tensor],
     ) -> torch.Tensor:
-        if self.od_config.enable_cpu_offload and not getattr(
-            self.od_config, "enable_distributed_layerwise_offload", False
-        ):
-            # Invoke nn.Module.__call__ so the generic model-level offloader
-            # swaps the resident DiT and encoder.
-            return self.text_encoder(input_ids, **vision_kwargs)
-
-        if self.od_config.enable_layerwise_offload or getattr(
-            self.od_config, "enable_distributed_layerwise_offload", False
-        ):
+        od_config = self.od_config
+        dlw = bool(getattr(od_config, "enable_distributed_layerwise_offload", False))
+        plain_lw = bool(od_config.enable_layerwise_offload) and not dlw
+        # Strategy priority mirrors the offload backend: distributed layer-wise,
+        # then plain layer-wise, then model-level. Plain layer-wise consumes the
+        # component selection -- an excluded encoder stays resident instead of
+        # paying a host round trip per request.
+        if dlw or (plain_lw and "text_encoder" in od_config.layerwise_component_selection()):
             # Layerwise DiT offload already provides the low-residency encoder
             # phase used by the checkpoint reference.
             self.text_encoder.load_to_device()
@@ -1158,23 +1152,35 @@ class MiniMaxH3Pipeline(
             finally:
                 self.text_encoder.offload_to_cpu()
 
+        if od_config.enable_cpu_offload and not dlw and not plain_lw:
+            # Invoke nn.Module.__call__ so the generic model-level offloader
+            # swaps the resident DiT and encoder.
+            return self.text_encoder(input_ids, **vision_kwargs)
+
         # Keep both Qwen and DiT resident across requests. Moving either model
         # here makes encoder latency include a tens-of-gigabytes PCIe transfer,
         # which defeats the no-offload contract.
         self.text_encoder.load_to_device()
         return self.text_encoder.encode_ids(input_ids, **vision_kwargs)
 
-    def _uses_manual_component_offload(self) -> bool:
+    def _vae_staging_active(self) -> bool:
+        """Whether the VAEs live on the host between uses.
+
+        Same strategy priority as the offload backend: distributed layer-wise
+        always stages; plain layer-wise stages the VAEs exactly when its
+        component selection covers them; otherwise the model-level host-staging
+        policy decides.
+        """
         od_config = getattr(self, "od_config", None)
-        return bool(
-            getattr(od_config, "enable_layerwise_offload", False)
-            or getattr(od_config, "enable_distributed_layerwise_offload", False)
-            or model_level_vae_host_staging_requested(od_config)
-        )
+        if getattr(od_config, "enable_distributed_layerwise_offload", False):
+            return True
+        if getattr(od_config, "enable_layerwise_offload", False):
+            return "vae" in od_config.layerwise_component_selection()
+        return model_level_vae_host_staging_requested(od_config)
 
     @contextmanager
     def _component_on_device(self, component: nn.Module):
-        staged = self._uses_manual_component_offload()
+        staged = self._vae_staging_active()
         if staged:
             component.load_to_device()
         try:

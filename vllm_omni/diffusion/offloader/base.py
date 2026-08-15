@@ -35,6 +35,9 @@ class OffloadConfig:
     # Operator policy: under model-level offload, allow pipeline-staged VAEs to
     # stay in host memory instead of resident on the device.
     vae_cpu_offload: bool = False
+    # Component families layer-wise offloading may manage; a family left out
+    # stays fully device-resident (see OmniDiffusionConfig.layerwise_offload_components).
+    layerwise_components: frozenset[str] = frozenset({"dit", "text_encoder", "vae"})
 
     @classmethod
     def from_od_config(cls, od_config: OmniDiffusionConfig) -> "OffloadConfig":
@@ -134,6 +137,19 @@ class OffloadConfig:
                 "rank-local weights) or disable HSDP."
             )
 
+        selection = getattr(od_config, "layerwise_component_selection", None)
+        layerwise_components = frozenset(selection()) if callable(selection) else OffloadConfig.layerwise_components
+        if strategy is not OffloadStrategy.LAYER_WISE and layerwise_components != OffloadConfig.layerwise_components:
+            # Only plain layer-wise offloading consumes the selection; say so
+            # instead of letting the narrowed value silently do nothing under
+            # another strategy (distributed layer-wise takes priority).
+            logger.warning(
+                "layerwise_offload_components=%s is consumed by plain layer-wise offloading only; "
+                "the active strategy %s ignores it.",
+                sorted(layerwise_components),
+                strategy.value,
+            )
+
         return cls(
             strategy=strategy,
             pin_cpu_memory=pin_cpu_memory,
@@ -143,6 +159,7 @@ class OffloadConfig:
             dlo_resident_layers=dlo_resident_layers,
             model_path=getattr(od_config, "model", None),
             vae_cpu_offload=bool(vae_cpu_offload),
+            layerwise_components=layerwise_components,
         )
 
 

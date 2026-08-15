@@ -686,6 +686,7 @@ class _DiffusionConfigProjection:
     enable_cpu_offload: bool = False
     vae_cpu_offload: bool = False
     enable_layerwise_offload: bool = False
+    layerwise_offload_components: str | None = None
     enable_distributed_layerwise_offload: bool = False
     dlo_use_allgather: bool = True
     dlo_resident_layers: int = Field(default=0, ge=0)
