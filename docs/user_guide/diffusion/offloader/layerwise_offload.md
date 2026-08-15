@@ -43,6 +43,20 @@ vllm serve Wan-AI/Wan2.2-T2V-A14B-Diffusers \
   --omni --enable-layerwise-offload
 ```
 
+By default, layerwise offloading may manage every component family. Use
+`--layerwise-offload-components` to narrow that set:
+
+```bash
+vllm serve MODEL --omni --enable-layerwise-offload \
+  --layerwise-offload-components text_encoder,vae
+```
+
+The value is a non-empty comma-separated list drawn from `dit`,
+`text_encoder`, and `vae`; unknown names fail configuration validation.
+Leaving `dit` out keeps the complete DiT device-resident and installs no DiT
+streaming hooks. Encoder and VAE selection applies to pipelines that declare
+the corresponding layerwise streaming or staging capability.
+
 ## Model integration
 
 Transformer classes declare containers of executable blocks:

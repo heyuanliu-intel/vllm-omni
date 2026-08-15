@@ -501,6 +501,24 @@ class LayerWiseOffloadBackend(OffloadBackend):
             except Exception as exc:
                 logger.debug("Failed to move resident module %s to GPU: %s", name, exc)
 
+        # The selection names which component families this backend may manage;
+        # a family left out stays fully device-resident. Excluding "dit" is the
+        # load-bearing case: it yields the topology where the DiT fits whole on
+        # the device and only the other components are offloaded, instead of
+        # paying the per-block streaming cost on the component that dominates
+        # step time.
+        selection = self.config.layerwise_components
+        if "dit" not in selection:
+            for dit_name, dit_module in zip(modules.dit_names, modules.dits):
+                dit_module.to(self.device)
+            logger.info(
+                "Layer-wise offload components=%s: DiT module(s) %s stay fully device-resident",
+                sorted(selection),
+                modules.dit_names,
+            )
+            self.enabled = True
+            return
+
         logger.info("Applying layer-wise offloading on %s", modules.dit_names)
 
         # Apply block-wise offloading hook for each of the blocks in DiT model(s)
