@@ -52,6 +52,9 @@ class OffloadConfig:
     # blocks from the loader-selected host backing with H2D only.
     dlo_use_allgather: bool = True
     dlo_resident_layers: int = 0  # leading DiT layers kept on device
+    # Component families layer-wise offloading may manage; a family left out
+    # stays fully device-resident (see OmniDiffusionConfig.layerwise_offload_components).
+    layerwise_components: frozenset[str] = frozenset({"dit", "text_encoder", "vae"})
 
     @classmethod
     def from_od_config(cls, od_config: OmniDiffusionConfig) -> "OffloadConfig":
@@ -150,6 +153,9 @@ class OffloadConfig:
                 "rank-local weights) or disable HSDP."
             )
 
+        selection = getattr(od_config, "layerwise_component_selection", None)
+        layerwise_components = frozenset(selection()) if callable(selection) else OffloadConfig.layerwise_components
+
         return cls(
             strategy=strategy,
             pin_cpu_memory=pin_cpu_memory,
@@ -157,6 +163,7 @@ class OffloadConfig:
             dp_size=dp_size,
             dlo_use_allgather=dlo_use_allgather,
             dlo_resident_layers=dlo_resident_layers,
+            layerwise_components=layerwise_components,
         )
 
 
