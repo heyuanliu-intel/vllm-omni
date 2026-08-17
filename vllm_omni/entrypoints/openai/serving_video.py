@@ -42,7 +42,9 @@ logger = init_logger(__name__)
 class ReferenceImage:
     """Reference class for tracking additional metadata if needed"""
 
-    data: Image.Image
+    # A list carries multi-keyframe intake (MiniMax H3 FL2VA first/last);
+    # single-image callers keep passing a bare Image.
+    data: Image.Image | list[Image.Image]
 
 
 @dataclass

@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -143,6 +143,48 @@ def _load_image(value: Any) -> Image.Image:
             array = array * 255.0
         return Image.fromarray(array.clip(0, 255).astype(np.uint8)).convert("RGB")
     raise TypeError(f"unsupported MiniMax H3 image input {type(value)!r}")
+
+
+def _load_images(value: Any) -> list[Image.Image]:
+    if isinstance(value, (list, tuple)):
+        if not value:
+            raise ValueError("MiniMax H3 image input must not be empty")
+        return [_load_image(item) for item in value]
+    return [_load_image(value)]
+
+
+def _as_int_list(value: Any, *, name: str) -> list[int]:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be an integer or a list of integers")
+    if isinstance(value, (int, np.integer)):
+        return [int(value)]
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        result = list(value)
+        if not result:
+            raise ValueError(f"{name} must not be empty")
+        if any(isinstance(item, bool) or not isinstance(item, (int, np.integer)) for item in result):
+            raise ValueError(f"{name} must contain only integers")
+        return [int(item) for item in result]
+    raise ValueError(f"{name} must be an integer or a list of integers")
+
+
+def _resolve_fl2va_keyframe_indices(extra: Mapping[str, Any], image_count: int) -> list[int]:
+    target = extra.get("target")
+    target = target if isinstance(target, Mapping) else {}
+    raw = extra.get("frame_indices", extra.get("frame_index"))
+    if raw is None:
+        raw = target.get("frame_indices", target.get("frame_index"))
+    if raw is None:
+        raw_indices = [0] if image_count == 1 else [0, -1]
+    else:
+        raw_indices = _as_int_list(raw, name="frame_indices")
+    if len(raw_indices) != image_count:
+        raise ValueError(
+            f"MiniMax H3 FL2VA requires one frame index per image: got {raw_indices!r} for {image_count} image(s)"
+        )
+    if tuple(raw_indices) not in ((0,), (-1,), (0, -1)):
+        raise ValueError("MiniMax H3 FL2VA frame_indices must be [0], [-1], or [0, -1]")
+    return raw_indices
 
 
 def _load_audio(value: Any) -> tuple[torch.Tensor, int]:
@@ -488,6 +530,7 @@ class MiniMaxH3Pipeline(
         task: str,
         prompt: str,
         image: Image.Image | None,
+        images: list[Image.Image] | None = None,
         prepared_videos: list[dict[str, Any]] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         _, rank, _ = _dit_rank_world()
@@ -495,6 +538,7 @@ class MiniMaxH3Pipeline(
         tags = None
         ids = None
         vision_kwargs: dict[str, torch.Tensor] = {}
+        images = list(images) if images else ([image] if image is not None else [])
         if rank == 0:
             if task == "t2va":
                 ids = minimax_h3_text_only_ids(self.tokenizer, prompt)
@@ -549,32 +593,32 @@ class MiniMaxH3Pipeline(
                     "video_grid_thw": video_grid,
                 }
             else:
-                if image is None:
+                if not images:
                     raise ValueError(f"{task} requires one image")
                 vision = self.processor.image_processor(
-                    images=[image],
+                    images=images,
                     return_tensors="pt",
                 )
                 image_grid = vision["image_grid_thw"]
                 merge = int(self.processor.image_processor.merge_size) ** 2
-                image_tokens = int(image_grid[0].prod().item()) // merge
+                image_token_counts = [int(grid.prod().item()) // merge for grid in image_grid]
                 if task == "fl2va":
                     ids = minimax_h3_multi_image_presentation_ids(
                         self.tokenizer,
                         prompt=prompt,
-                        image_token_counts=[image_tokens],
+                        image_token_counts=image_token_counts,
                     )
                     tags = minimax_h3_multi_image_presentation_token_tags(
                         self.tokenizer,
                         prompt=prompt,
-                        image_token_counts=[image_tokens],
+                        image_token_counts=image_token_counts,
                     )
                 else:
                     ids, tags = minimax_h3_ref2va_presentation(
                         self.tokenizer,
                         prompt=prompt,
                         condition_labels=[("image", 1), ("audio", 1)],
-                        image_token_count=image_tokens,
+                        image_token_count=image_token_counts[0],
                     )
                 vision_kwargs = {
                     "pixel_values": vision["pixel_values"],
@@ -914,6 +958,7 @@ class MiniMaxH3Pipeline(
         visual_condition_shapes: list[tuple[int, int, int]] | None = None,
         audio_condition_lengths: list[int] | None = None,
         pad_seq_len: int | None = None,
+        keyframe_frame_indices: list[int] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         initial_video, initial_audio = self._initial_noise(
             seed=seed,
@@ -948,7 +993,7 @@ class MiniMaxH3Pipeline(
                 latent_w=latent_w,
                 audio_t=audio_t,
                 include_keyframe_cond=task == "fl2va",
-                keyframe_frame_indices=[0] if task == "fl2va" else None,
+                keyframe_frame_indices=(keyframe_frame_indices or [0]) if task == "fl2va" else None,
                 frame_count=num_frames if task == "fl2va" else None,
                 seq_len=pad_seq_len,
             )
@@ -1094,7 +1139,13 @@ class MiniMaxH3Pipeline(
 
         raw_image = multi_modal_data.get("image")
         raw_videos = multi_modal_data.get("video")
-        image = _load_image(raw_image) if raw_image is not None else None
+        # FL2VA accepts up to two keyframes (first / last / first+last, the
+        # upstream MINIMAX_H3_FL2VA_KEYFRAME_SIGNATURES contract); every other
+        # task keeps the single-image intake unchanged.
+        images = _load_images(raw_image) if task == "fl2va" and raw_image is not None else []
+        if task == "fl2va" and len(images) > 2:
+            raise ValueError("fl2va accepts at most first and last images")
+        image = images[0] if images else (_load_image(raw_image) if raw_image is not None else None)
         if task == "fl2va" and image is None:
             raise ValueError(f"{task} requires multi_modal_data.image")
         if task == "ref2va" and image is None and raw_videos is None:
@@ -1113,35 +1164,42 @@ class MiniMaxH3Pipeline(
         height, width, num_frames, latent_t, audio_t = self._resolve_shape(task, sampling, image)
         ar_tolerance = float(os.getenv("H3_AR_TOLERANCE", "0.02"))
         prepared_image = image
-        if task == "fl2va" and image is not None:
-            mismatch = _ar_mismatch_ratio(image.size, width, height)
-            if mismatch > ar_tolerance:
-                # Never silently stretch an AR-mismatched frame: center-crop
-                # by default, with letterbox as an explicit request policy.
-                policy = str(extra.get("frame_ar_policy") or "center_crop")
-                if policy == "center_crop":
-                    shaped = _center_crop_to_aspect(image, width, height)
-                elif policy == "letterbox":
-                    shaped = _pad_to_aspect(image, width, height)
-                else:
-                    raise ValueError(
-                        "frame_ar_policy must be center_crop or letterbox, "
-                        f"got {policy!r}"
+        prepared_images: list[Image.Image] = []
+        keyframe_frame_indices: list[int] | None = None
+        if task == "fl2va" and images:
+            keyframe_frame_indices = _resolve_fl2va_keyframe_indices(extra, len(images))
+            for frame_index, item in zip(keyframe_frame_indices, images, strict=True):
+                mismatch = _ar_mismatch_ratio(item.size, width, height)
+                if mismatch > ar_tolerance:
+                    # Never silently stretch an AR-mismatched frame: center-crop
+                    # by default, with letterbox as an explicit request policy.
+                    policy = str(extra.get("frame_ar_policy") or "center_crop")
+                    if policy == "center_crop":
+                        shaped = _center_crop_to_aspect(item, width, height)
+                    elif policy == "letterbox":
+                        shaped = _pad_to_aspect(item, width, height)
+                    else:
+                        raise ValueError(
+                            "frame_ar_policy must be center_crop or letterbox, "
+                            f"got {policy!r}"
+                        )
+                    logger.info(
+                        "[H3FrameAR] task=fl2va frame=%d in=%dx%d target=%dx%d mismatch=%.4f policy=%s",
+                        frame_index, item.width, item.height, width, height, mismatch, policy,
                     )
-                logger.info(
-                    "[H3FrameAR] task=fl2va in=%dx%d target=%dx%d mismatch=%.4f policy=%s",
-                    image.width, image.height, width, height, mismatch, policy,
+                else:
+                    shaped = item
+                    logger.info(
+                        "[H3FrameAR] task=fl2va frame=%d in=%dx%d target=%dx%d mismatch=%.4f policy=resize",
+                        frame_index, item.width, item.height, width, height, mismatch,
+                    )
+                prepared_images.append(
+                    shaped.resize(
+                        (width, height),
+                        Image.Resampling.LANCZOS,
+                    )
                 )
-            else:
-                shaped = image
-                logger.info(
-                    "[H3FrameAR] task=fl2va in=%dx%d target=%dx%d mismatch=%.4f policy=resize",
-                    image.width, image.height, width, height, mismatch,
-                )
-            prepared_image = shaped.resize(
-                (width, height),
-                Image.Resampling.LANCZOS,
-            )
+            prepared_image = prepared_images[0]
         elif task == "ref2va" and image is not None:
             if os.getenv("H3_REF_LETTERBOX", "1") != "0":
                 mismatch = _ar_mismatch_ratio(image.size, width, height)
@@ -1207,6 +1265,7 @@ class MiniMaxH3Pipeline(
                 task=task,
                 prompt=prompt,
                 image=prepared_image,
+                images=prepared_images if len(prepared_images) > 1 else None,
                 prepared_videos=prepared_videos,
             )
 
@@ -1236,6 +1295,20 @@ class MiniMaxH3Pipeline(
                             "latent_w": shape[2],
                         }
                     )
+            elif len(prepared_images) > 1:
+                # Dual-keyframe FL2VA: one VAE row block per keyframe, in
+                # frame-index order (0 then -1) to match the packed cond
+                # layout produced by keyframe_frame_indices.
+                condition_rows = [self._encode_visual_condition(item) for item in prepared_images]
+                visual_condition = torch.cat(condition_rows)
+                visual_shapes = [
+                    (
+                        1,
+                        item.height // 16,
+                        item.width // 16,
+                    )
+                    for item in prepared_images
+                ]
             elif prepared_image is not None:
                 visual_condition = self._encode_visual_condition(prepared_image)
                 visual_shape = (
@@ -1282,6 +1355,7 @@ class MiniMaxH3Pipeline(
             visual_condition_shapes=visual_shapes,
             audio_condition_lengths=audio_lengths,
             pad_seq_len=pad_seq_len,
+            keyframe_frame_indices=keyframe_frame_indices,
         )
         video, audio = self.decode(
             video_latent,

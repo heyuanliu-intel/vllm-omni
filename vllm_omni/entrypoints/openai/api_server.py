@@ -2937,6 +2937,7 @@ async def _parse_video_form(
     raw_request: Request,
     prompt: str = Form(...),
     input_reference: UploadFile | None = File(default=None),
+    input_references: list[UploadFile] | None = File(default=None),
     image_reference: str | None = Form(default=None),
     video_reference: str | None = Form(default=None),
     audio_reference: str | None = Form(default=None),
@@ -2978,6 +2979,8 @@ async def _parse_video_form(
     Used by both ``POST /v1/videos`` (async) and ``POST /v1/videos/sync``.
     """
     input_reference_bytes = await input_reference.read() if input_reference is not None else None
+    input_references = input_references or []
+    input_references_bytes = [await item.read() for item in input_references]
     parsed_image_reference = _parse_form_json(image_reference)
     parsed_video_reference = _parse_form_json(video_reference)
     parsed_audio_reference = _parse_form_json(audio_reference)
@@ -2985,6 +2988,11 @@ async def _parse_video_form(
     provided_references = sum(
         item is not None for item in (parsed_image_reference, parsed_video_reference, input_reference_bytes)
     )
+    if input_references_bytes and provided_references:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail="Provide input_references alone, without input_reference, image_reference, or video_reference.",
+        )
     if provided_references > 1:
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,
@@ -3073,6 +3081,30 @@ async def _parse_video_form(
 
     reference_image = ReferenceImage(data=media_data) if isinstance(media_data, Image.Image) else None
     reference_video = ReferenceVideo(data=media_data) if isinstance(media_data, list) else None
+
+    if input_references_bytes:
+        # Multi-keyframe intake (MiniMax H3 FL2VA first/last): every
+        # input_references item must decode to a still image; videos keep
+        # using the singular input_reference field.
+        decoded_references: list[Image.Image] = []
+        for index, item_bytes in enumerate(input_references_bytes):
+            try:
+                decoded = await decode_input_reference(
+                    None,
+                    None,
+                    item_bytes,
+                    max_video_frames=decode_spec.max_frames,
+                    video_keep=decode_spec.keep,
+                )
+            except InvalidInputReferenceError as exc:
+                raise HTTPException(400, detail=str(exc) or "Invalid input reference.") from exc
+            if not isinstance(decoded, Image.Image):
+                raise HTTPException(
+                    status_code=HTTPStatus.BAD_REQUEST.value,
+                    detail=f"input_references[{index}] must be a still image.",
+                )
+            decoded_references.append(decoded)
+        reference_image = ReferenceImage(data=decoded_references)
 
     reference_audio: ReferenceAudio | None = None
     if request.audio_reference is not None:
