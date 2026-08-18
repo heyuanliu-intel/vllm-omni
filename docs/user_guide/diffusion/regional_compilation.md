@@ -34,5 +34,26 @@ that provide their own `setup_compile()` implementation manage their compilation
 policy independently. Compilation is lazy, so backend or graph errors can first
 surface on the initial request.
 
+## Keeping one compiled shape
+
+Compiled regions are keyed by input shape, so a pipeline whose sequence length
+follows the request — a longer prompt, a different reference image — hands the
+compiler a shape it has not seen before and pays for a recompilation.
+
+MiniMax-H3 lets a request pin that length with `extra_args["pad_seq_len"]`
+(a positive multiple of 64, at least the rows the request actually uses):
+
+```python
+sampling_params = SamplingParams(extra_args={"pad_seq_len": 54080})
+```
+
+The packed sequence is then padded to that fixed length instead of to the next
+64-row boundary, so requests of different prompt lengths share one compiled
+shape. The server logs the effective length as
+`MiniMax H3 packed sequence: ... pad_seq_len=... used=... seq_len=...`
+whenever a request pins it. Pick a bucket that covers the longest prompt the
+deployment accepts; the padding rows are masked out, so the extra cost is the
+attention and feed-forward work on those rows.
+
 Use `--enforce-eager` to disable the model runner's generic compile setup.
 Pipelines that compile internally define their own eager-mode behavior.

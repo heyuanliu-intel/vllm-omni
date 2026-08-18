@@ -161,3 +161,72 @@ def test_condition_noise_accepts_a_reference_video_longer_than_the_target():
         noise_aug=0.5,
     )
     assert result.shape == rows.shape
+
+
+def test_explicit_seq_len_pins_one_shape_across_prompt_lengths():
+    """Prompts of different token counts must land on the same packed length.
+
+    Without the pin they fall into different 64-row buckets, and every new
+    bucket is a shape the compiled transformer has not seen yet.
+    """
+    from vllm_omni.diffusion.models.minimax_h3.packed_sequence import (
+        minimax_h3_packed_sequence,
+    )
+
+    common = dict(
+        latent_t=2,
+        latent_h=4,
+        latent_w=6,
+        audio_t=3,
+        include_keyframe_cond=False,
+    )
+    # 22 used rows -> bucket 64; 118 used rows -> bucket 128.
+    short = minimax_h3_packed_sequence(text_len=4, **common)
+    long = minimax_h3_packed_sequence(text_len=100, **common)
+    assert int(short["seq_len"]) == 64
+    assert int(long["seq_len"]) == 128
+
+    short_pinned = minimax_h3_packed_sequence(text_len=4, seq_len=192, **common)
+    long_pinned = minimax_h3_packed_sequence(text_len=100, seq_len=192, **common)
+    assert int(short_pinned["seq_len"]) == int(long_pinned["seq_len"]) == 192
+    # The pin only adds padding rows; the used prefix is untouched.
+    assert int(short_pinned["cu_seqlens"][1]) == int(short["cu_seqlens"][1])
+    assert int(long_pinned["cu_seqlens"][1]) == int(long["cu_seqlens"][1])
+    assert short_pinned["img_pos"].tolist() == short["img_pos"].tolist()
+
+
+def test_explicit_seq_len_below_used_rows_is_rejected():
+    from vllm_omni.diffusion.models.minimax_h3.packed_sequence import (
+        minimax_h3_packed_sequence,
+    )
+
+    with pytest.raises(ValueError, match="used rows"):
+        minimax_h3_packed_sequence(
+            text_len=4,
+            latent_t=2,
+            latent_h=4,
+            latent_w=6,
+            audio_t=3,
+            include_keyframe_cond=False,
+            seq_len=8,
+        )
+
+
+@pytest.mark.parametrize("value", [0, -64, 100, "128", True, 1.5])
+def test_pad_seq_len_request_validation_rejects_bad_values(value):
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        _resolve_pad_seq_len,
+    )
+    from vllm_omni.errors import OmniClientError
+
+    with pytest.raises(OmniClientError):
+        _resolve_pad_seq_len(value)
+
+
+def test_pad_seq_len_request_validation_accepts_aligned_values():
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        _resolve_pad_seq_len,
+    )
+
+    assert _resolve_pad_seq_len(None) is None
+    assert _resolve_pad_seq_len(54080) == 54080

@@ -38,7 +38,8 @@ _INTERP = 32
 _T_GROUP = 5
 _FRAME_PER_TOKEN = (1, 4, 4, 4, 4)
 _FRAME_RESCALE = 5.0 / 3.0
-_SEQ_ALIGN = 64
+MINIMAX_H3_SEQ_ALIGN = 64
+"""Row alignment of the packed sequence; an explicit ``seq_len`` must be a multiple of it."""
 # MiniMax H3 packs video latents with a fixed [1, 2, 2] (t, h, w) patch.
 _PATCH_T = 1
 _PATCH_H = 2
@@ -124,10 +125,15 @@ def minimax_h3_packed_sequence(
     include_keyframe_cond: bool,
     keyframe_frame_indices: list[int] | tuple[int, ...] | None = None,
     frame_count: int | None = None,
+    seq_len: int | None = None,
 ) -> dict[str, torch.Tensor]:
     """Build the packed-sequence structural fields for one CFG branch.
 
-    The used length is padded up to a multiple of 64.
+    The used length is padded up to a multiple of 64, or to an explicit
+    ``seq_len`` (which must be >= the used rows) — same contract as
+    ``minimax_h3_packed_sequence_ref2va_blocks``. Pinning the length keeps
+    every request on one compiled shape, so prompts of different token
+    counts do not each trigger a recompilation.
     """
     ph, pw = latent_h // _PATCH_H, latent_w // _PATCH_W
     frame_rows = ph * pw
@@ -143,7 +149,10 @@ def minimax_h3_packed_sequence(
     video_rows = latent_t * frame_rows
     audio_rows = audio_t * audio_channel
     used = text_len + cond_rows + audio_rows + video_rows
-    seq_len = ((used + _SEQ_ALIGN - 1) // _SEQ_ALIGN) * _SEQ_ALIGN
+    if seq_len is None:
+        seq_len = ((used + MINIMAX_H3_SEQ_ALIGN - 1) // MINIMAX_H3_SEQ_ALIGN) * MINIMAX_H3_SEQ_ALIGN
+    if seq_len < used:
+        raise ValueError(f"seq_len {seq_len} < used rows {used}")
 
     text_sl = slice(0, text_len)
     cond_sl = slice(text_len, text_len + cond_rows)
@@ -369,7 +378,7 @@ def minimax_h3_packed_sequence_ref2va_blocks(
     ref_rows = ref_visual_rows + ref_audio_rows
     used = text_len + ref_rows + audio_rows + video_rows
     if seq_len is None:
-        seq_len = ((used + _SEQ_ALIGN - 1) // _SEQ_ALIGN) * _SEQ_ALIGN
+        seq_len = ((used + MINIMAX_H3_SEQ_ALIGN - 1) // MINIMAX_H3_SEQ_ALIGN) * MINIMAX_H3_SEQ_ALIGN
     if seq_len < used:
         raise ValueError(f"seq_len {seq_len} < used rows {used}")
 
