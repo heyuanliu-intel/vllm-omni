@@ -267,6 +267,34 @@ def test_ltx_reference_image_size_policy(tmp_path, model_version: str, expected:
     )
 
 
+def test_minimax_h3_preserves_reference_image_size() -> None:
+    """MiniMax-H3 owns reference geometry, so the serving layer must not resize.
+
+    Regression guard: without the registry entry the serving layer falls back
+    to resizing the reference image to the requested output size, which
+    distorts what the pipeline encodes and makes its own geometry validation
+    describe the resized copy instead of the client's image.
+    """
+    assert (
+        should_preserve_reference_image_size(
+            "MiniMaxH3Pipeline",
+            model="MiniMaxAI/MiniMax-H3",
+        )
+        is True
+    )
+
+
+def test_reference_image_size_policy_defaults_to_false_for_other_models() -> None:
+    """Models that declare nothing keep the historical resize behaviour."""
+    assert (
+        should_preserve_reference_image_size(
+            "SomeUnregisteredPipeline",
+            model="org/model",
+        )
+        is False
+    )
+
+
 def test_reference_image_size_policy_threads_revision(monkeypatch: pytest.MonkeyPatch) -> None:
     captured = {}
 

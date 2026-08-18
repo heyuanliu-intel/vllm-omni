@@ -34,6 +34,9 @@ from vllm_omni.model_extras.helios import (
 )
 from vllm_omni.model_extras.hunyuan_image3 import build_x_to_text_prompt as build_hunyuan_x_to_text_prompt
 from vllm_omni.model_extras.lingbot_video import LINGBOT_VIDEO_EXTRA_BODY_PARAMS
+from vllm_omni.model_extras.minimax_h3 import (
+    minimax_h3_preserves_reference_image_size,
+)
 from vllm_omni.model_extras.ltx2 import (
     LTX_EXTRA_BODY_PARAMS,
     LTX_EXTRA_OUTPUT_PARAMS,
@@ -234,6 +237,9 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
             "LTX2DistilledPipeline",
             "LTX2DistilledTwoStagePipeline",
         )
+    },
+    "MiniMaxH3Pipeline": {
+        "reference_image_size_resolver": minimax_h3_preserves_reference_image_size,
     },
     "WanVACEPipeline": {
         "extra_body_params": VACE_EXTRA_BODY_PARAMS,
