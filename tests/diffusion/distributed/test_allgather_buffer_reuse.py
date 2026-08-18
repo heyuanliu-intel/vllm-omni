@@ -25,7 +25,7 @@ from vllm_omni.diffusion.distributed.group_coordinator import GroupCoordinator
 
 
 def _run(
-    body: Callable[[GroupCoordinator, int, int], None], local_rank: int, world_size: int, master_port: int, reuse: str
+    body: Callable[[GroupCoordinator, int, int], None], local_rank: int, world_size: int, master_port: int
 ) -> None:
     """Build a gloo group and a coordinator directly.
 
