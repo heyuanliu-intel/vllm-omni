@@ -521,6 +521,20 @@ class _SingleRankEncoderGroup:
         self.device_group = None
 
 
+def _layerwise_component_selection(od_config) -> frozenset[str]:
+    """The layer-wise component families, tolerating configs without the knob.
+
+    ``OffloadConfig.from_od_config`` already reads the selection defensively;
+    the pipeline must match, because it is handed plain stubs and older config
+    objects too. Absent the accessor the pre-existing behavior applies: every
+    family is managed.
+    """
+    selection = getattr(od_config, "layerwise_component_selection", None)
+    if callable(selection):
+        return frozenset(selection())
+    return frozenset({"dit", "text_encoder", "vae"})
+
+
 class MiniMaxH3Pipeline(
     nn.Module,
     DenoiseProgressMixin,
@@ -1143,7 +1157,7 @@ class MiniMaxH3Pipeline(
         # then plain layer-wise, then model-level. Plain layer-wise consumes the
         # component selection -- an excluded encoder stays resident instead of
         # paying a host round trip per request.
-        if dlw or (plain_lw and "text_encoder" in od_config.layerwise_component_selection()):
+        if dlw or (plain_lw and "text_encoder" in _layerwise_component_selection(od_config)):
             # Layerwise DiT offload already provides the low-residency encoder
             # phase used by the checkpoint reference.
             self.text_encoder.load_to_device()
@@ -1175,7 +1189,7 @@ class MiniMaxH3Pipeline(
         if getattr(od_config, "enable_distributed_layerwise_offload", False):
             return True
         if getattr(od_config, "enable_layerwise_offload", False):
-            return "vae" in od_config.layerwise_component_selection()
+            return "vae" in _layerwise_component_selection(od_config)
         return model_level_vae_host_staging_requested(od_config)
 
     @contextmanager

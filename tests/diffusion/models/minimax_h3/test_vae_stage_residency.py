@@ -357,8 +357,14 @@ def test_evict_module_to_host_moves_parameters_and_buffers(monkeypatch: pytest.M
     from vllm_omni.platforms import current_omni_platform
 
     ec_calls = []
+    # raising=False: platforms that never take this path (XPU skips the
+    # eviction empty_cache by design) do not define the attribute at all, and
+    # the "zero calls" contract must still be checked there.
     monkeypatch.setattr(
-        type(current_omni_platform), "empty_cache", classmethod(lambda cls: ec_calls.append(1))
+        type(current_omni_platform),
+        "empty_cache",
+        classmethod(lambda cls: ec_calls.append(1)),
+        raising=False,
     )
 
     assert evict_module_to_host(block) is True
