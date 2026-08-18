@@ -49,7 +49,7 @@ class _Recorder:
 
     # Borrow the real predicates so the tests exercise production logic rather
     # than a second copy of it.
-    _uses_manual_component_offload = MiniMaxH3Pipeline._uses_manual_component_offload
+    _vae_staging_active = MiniMaxH3Pipeline._vae_staging_active
     _vae_stage_offload_active = MiniMaxH3Pipeline._vae_stage_offload_active
 
 
@@ -186,13 +186,13 @@ def test_offload_stage_output_nonowner_rank_drops_storage_without_d2h() -> None:
 
 
 def test_gate_ignores_widened_manual_predicate() -> None:
-    # The gate must consult exactly the two layerwise flags. On the frozen base
-    # _uses_manual_component_offload is equivalent, but contributors to that
-    # predicate exist (host-staged VAEs: enable_cpu_offload AND vae_cpu_offload)
-    # and they do NOT stream the DiT -- routing the gate through the predicate
-    # silently disabled the eviction on exactly the target configuration.
+    # The gate must consult exactly the two layerwise flags. The VAE-staging
+    # predicate is close but not equivalent: host-staged VAEs
+    # (enable_cpu_offload AND vae_cpu_offload) also stage, and they do NOT
+    # stream the DiT -- routing the gate through that predicate silently
+    # disabled the eviction on exactly the target configuration.
     rec = _Recorder(enable_cpu_offload=True)
-    rec._uses_manual_component_offload = lambda: True
+    rec._vae_staging_active = lambda: True
 
     assert MiniMaxH3Pipeline._vae_stage_offload_active(rec) is True, (
         "a widened manual-staging predicate must not disable the DiT eviction"
