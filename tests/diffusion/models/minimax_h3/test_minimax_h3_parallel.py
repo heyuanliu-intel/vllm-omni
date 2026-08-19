@@ -8,6 +8,74 @@ import torch.nn as nn
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
+class _FakeEncoderGroup:
+    def __init__(self):
+        self.world_size = 2
+        self.rank_in_group = 0
+        self.ranks = [0, 1]
+        self.cpu_group = object()
+        self.device_group = object()
+
+
+def test_encoder_cpu_control_plane_env_is_strict(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        _MINIMAX_H3_CPU_CONTROL_PLANE_ENV,
+        _minimax_h3_cpu_control_plane_enabled,
+    )
+
+    monkeypatch.delenv(_MINIMAX_H3_CPU_CONTROL_PLANE_ENV, raising=False)
+    assert _minimax_h3_cpu_control_plane_enabled() is False
+    monkeypatch.setenv(_MINIMAX_H3_CPU_CONTROL_PLANE_ENV, "1")
+    assert _minimax_h3_cpu_control_plane_enabled() is True
+    monkeypatch.setenv(_MINIMAX_H3_CPU_CONTROL_PLANE_ENV, "true")
+    with pytest.raises(ValueError, match="must be 0 or 1"):
+        _minimax_h3_cpu_control_plane_enabled()
+
+
+@pytest.mark.parametrize(
+    ("cpu_control_plane", "expected_control_group"),
+    [(False, "device"), (True, "cpu")],
+)
+def test_encoder_metadata_uses_selected_control_group(
+    monkeypatch,
+    cpu_control_plane,
+    expected_control_group,
+):
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        MiniMaxH3Pipeline,
+    )
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    nn.Module.__init__(pipeline)
+    pipeline.device = torch.device("cuda")
+    pipeline.text_encoder_group = _FakeEncoderGroup()
+    pipeline._encoder_cpu_control_plane = cpu_control_plane
+    pipeline._encoder_cpu_control_plane_logged = False
+    broadcast_groups = []
+
+    control_device, _ = pipeline._encoder_control_plane()
+    expected_device = torch.device("cpu") if cpu_control_plane else pipeline.device
+    assert control_device == expected_device
+    pipeline.device = torch.device("cpu")
+
+    def record_broadcast(tensor, *, src, group):
+        del tensor, src
+        broadcast_groups.append(group)
+
+    monkeypatch.setattr(torch.distributed, "broadcast", record_broadcast)
+
+    ids = pipeline._distribute_encode_inputs(torch.tensor([1, 2]), {})
+
+    expected = (
+        pipeline.text_encoder_group.cpu_group
+        if expected_control_group == "cpu"
+        else pipeline.text_encoder_group.device_group
+    )
+    assert broadcast_groups[:2] == [expected, expected]
+    assert broadcast_groups[2] is pipeline.text_encoder_group.device_group
+    torch.testing.assert_close(ids, torch.tensor([1, 2]))
+
+
 def test_grouped_qkv_checkpoint_reorder():
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
         _reorder_grouped_qkv_to_qkv,

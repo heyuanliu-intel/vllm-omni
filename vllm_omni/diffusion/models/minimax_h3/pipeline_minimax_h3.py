@@ -111,6 +111,7 @@ MINIMAX_H3_FPS = 24
 MINIMAX_H3_AUDIO_SAMPLE_RATE = 32000
 MINIMAX_H3_IMGVID_COND_TIMESTEP = 0.999
 MINIMAX_H3_AUDIO_REF_COND_TIMESTEP = 1.0
+_MINIMAX_H3_CPU_CONTROL_PLANE_ENV = "VLLM_OMNI_MINIMAX_H3_CPU_CONTROL_PLANE"
 MINIMAX_H3_OUTPUT_SHORT_EDGE = 768
 MINIMAX_H3_OUTPUT_MAX_PIXELS = 768 * 1344
 MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE = 2048
@@ -132,6 +133,26 @@ MINIMAX_H3_DOWNLOAD_PATTERNS = [
     "Ref2VA/model_index.json",
     "Ref2VA/transformer/**",
 ]
+
+
+def _minimax_h3_cpu_control_plane_enabled() -> bool:
+    """Return whether H3 encoder metadata should use the CPU process group.
+
+    The workaround is intentionally opt-in while its XPU-specific failure mode
+    is validated. Rejecting unknown values prevents an A/B arm from silently
+    falling back to the default device-control path.
+    """
+
+    value = os.getenv(_MINIMAX_H3_CPU_CONTROL_PLANE_ENV, "0").strip()
+    if value == "0":
+        return False
+    if value == "1":
+        return True
+    raise ValueError(
+        f"{_MINIMAX_H3_CPU_CONTROL_PLANE_ENV} must be 0 or 1, got {value!r}"
+    )
+
+
 MINIMAX_H3_TASK_DOWNLOAD_PATTERNS = {
     "fl2va": ["FL2VA/**"],
     "ref2va": ["Ref2VA/**"],
@@ -612,6 +633,8 @@ class MiniMaxH3Pipeline(
         self.parallel_config = od_config.parallel_config
         if int(self.parallel_config.cfg_parallel_size) != 1:
             raise ValueError("MiniMax-H3 is CFG-distilled and has no negative branch; cfg_parallel_size must be 1")
+        self._encoder_cpu_control_plane = _minimax_h3_cpu_control_plane_enabled()
+        self._encoder_cpu_control_plane_logged = False
         self.device = get_local_device()
         self.partition = _minimax_h3_partition_for_task(
             getattr(od_config, "task_type", None),
@@ -1083,13 +1106,14 @@ class MiniMaxH3Pipeline(
                 raise ValueError("source tensor is required for single-rank execution")
             return tensor.to(device=device, dtype=dtype)
 
-        shape = torch.zeros(8, dtype=torch.long, device=device)
+        control_device, control_group = self._encoder_control_plane()
+        shape = torch.zeros(8, dtype=torch.long, device=control_device)
         if group.rank_in_group == 0:
             if tensor is None:
                 raise ValueError("encoder rank 0 must provide a tensor to broadcast")
             shape[0] = tensor.ndim
-            shape[1 : tensor.ndim + 1] = torch.tensor(tensor.shape, device=device)
-        torch.distributed.broadcast(shape, src=group.ranks[0], group=group.device_group)
+            shape[1 : tensor.ndim + 1] = torch.tensor(tensor.shape, device=control_device)
+        torch.distributed.broadcast(shape, src=group.ranks[0], group=control_group)
         ndim = int(shape[0].item())
         tensor_shape = tuple(int(value) for value in shape[1 : ndim + 1].tolist())
         if group.rank_in_group == 0:
@@ -1098,6 +1122,19 @@ class MiniMaxH3Pipeline(
             output = torch.empty(tensor_shape, device=device, dtype=dtype)
         torch.distributed.broadcast(output, src=group.ranks[0], group=group.device_group)
         return output
+
+    def _encoder_control_plane(self) -> tuple[torch.device, dist.ProcessGroup]:
+        """Select placement and process group for tiny encoder metadata."""
+
+        if self._encoder_cpu_control_plane:
+            if not self._encoder_cpu_control_plane_logged:
+                logger.info(
+                    "MiniMax H3 encoder control plane enabled=1 "
+                    "metadata_tensors=shape,vision_mask group=cpu_group"
+                )
+                self._encoder_cpu_control_plane_logged = True
+            return torch.device("cpu"), self.text_encoder_group.cpu_group
+        return self.device, self.text_encoder_group.device_group
 
     def _distribute_encode_inputs(
         self,
@@ -1123,11 +1160,12 @@ class MiniMaxH3Pipeline(
                 raise ValueError("encoder rank 0 must produce input ids")
             return ids.to(device=device, dtype=torch.long)
 
-        mask = torch.zeros(len(keys), dtype=torch.long, device=device)
+        control_device, control_group = self._encoder_control_plane()
+        mask = torch.zeros(len(keys), dtype=torch.long, device=control_device)
         if group.rank_in_group == 0:
             for index, key in enumerate(keys):
                 mask[index] = 1 if key in vision_kwargs else 0
-        torch.distributed.broadcast(mask, src=group.ranks[0], group=group.device_group)
+        torch.distributed.broadcast(mask, src=group.ranks[0], group=control_group)
 
         if group.rank_in_group == 0:
             ids = self._encoder_group_broadcast_tensor(ids, dtype=torch.long, device=device)
