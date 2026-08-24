@@ -467,17 +467,42 @@ class LayerWiseOffloadBackend(OffloadBackend):
         # resident.
         plan = get_offload_plan(pipeline)
         declared_on_demand = plan.on_demand_component_paths if plan is not None else frozenset()
+        selection = self.config.layerwise_components
         for enc, enc_name in zip(modules.encoders, modules.encoder_names):
-            if stream_declared_encoder_blocks(enc, enc_name, plan, self.device, pin_memory=self.config.pin_cpu_memory):
+            if "text_encoder" in selection and stream_declared_encoder_blocks(
+                enc,
+                enc_name,
+                plan,
+                self.device,
+                pin_memory=self.config.pin_cpu_memory,
+            ):
                 self._streamed_encoders.append(enc)
             offload_to_cpu = getattr(enc, "offload_to_cpu", None)
-            if enc_name in declared_on_demand and callable(offload_to_cpu):
+            if "text_encoder" in selection and enc_name in declared_on_demand and callable(offload_to_cpu):
                 offload_to_cpu()
             else:
                 enc.to(self.device)
 
-        # Move VAE(s) to GPU if available
-        for vae in modules.vaes:
+        # Pipelines may declare VAEs whose residency they stage around direct
+        # encode/decode calls. Leave those in host memory when the VAE family is
+        # selected; otherwise the selection contract keeps them resident.
+        resident_vaes: list[nn.Module] = []
+        staged_names: list[str] = []
+        for vae, vae_name in zip(modules.vaes, modules.vae_names):
+            offload_to_cpu = getattr(vae, "offload_to_cpu", None)
+            if "vae" in selection and vae_name in declared_on_demand and callable(offload_to_cpu):
+                offload_to_cpu()
+                staged_names.append(vae_name)
+            else:
+                resident_vaes.append(vae)
+        if staged_names:
+            logger.info(
+                "Layer-wise offloading leaves pipeline-staged VAE(s) in host memory: %s",
+                ", ".join(staged_names),
+            )
+
+        # Move resident VAE(s) to the device if available.
+        for vae in resident_vaes:
             try:
                 vae.to(self.device, non_blocking=True)
             except Exception as exc:
@@ -496,7 +521,6 @@ class LayerWiseOffloadBackend(OffloadBackend):
         # the device and only the other components are offloaded, instead of
         # paying the per-block streaming cost on the component that dominates
         # step time.
-        selection = self.config.layerwise_components
         if "dit" not in selection:
             for dit_name, dit_module in zip(modules.dit_names, modules.dits):
                 dit_module.to(self.device)
