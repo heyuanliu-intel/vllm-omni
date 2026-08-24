@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -269,6 +269,16 @@ def test_reference_image_size_policy_threads_revision(monkeypatch: pytest.Monkey
         revision="pinned-revision",
     )
     assert captured == {"model": "org/model", "revision": "pinned-revision"}
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize("model_class_name", ["MiniMaxH3Pipeline", "MiniMaxH3ModularPipeline"])
+def test_minimax_h3_preserves_reference_image_size(model_class_name: str) -> None:
+    assert should_preserve_reference_image_size(
+        model_class_name,
+        model="MiniMaxAI/MiniMax-H3",
+    )
 
 
 @pytest.mark.core_model
