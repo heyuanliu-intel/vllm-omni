@@ -22,7 +22,7 @@ The async diffusion output feature moves the D2H (Device→Host) copy and SHM pa
 ### HunyuanImage-3.0 (TP4)
 
 | Resolution | Async Off (QPS) | Async On (QPS) | Change |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 1024×1024 | 0.4773 | 0.4802 | +0.60% |
 | 768×768 | 0.8370 | 0.8533 | +1.95% |
 
@@ -32,7 +32,7 @@ The async diffusion output feature moves the D2H (Device→Host) copy and SHM pa
 
 ### Execution Timeline
 
-```
+```text
 Before (synchronous D2H):
 [forward req1] [D2H+SHM pack req1] [forward req2] [D2H+SHM pack req2]
                                  ^^^^^^^^^^^^^^^^ GPU bubble
@@ -45,7 +45,7 @@ After (async D2H):
 
 ### Data Flow
 
-```
+```text
                     ┌─────────────────────────────────────────────────────┐
                     │                 Worker Process                      │
                     │                                                    │
@@ -143,12 +143,23 @@ All models running in request-mode (`step_execution=False`, the default) automat
 **Verified models**:
 
 | Model | Type | `supports_request_batch` |
-|---|---|---|
+| --- | --- | --- |
 | **HunyuanImage-3.0** | Image | `False` |
 | **Qwen-Image** | Image | `True` |
 | **LTX-2.3** | Video / Audio | `False` |
 
 Other models with `step_execution=False` are also supported but not yet verified.
+
+**Narrow exception -- MiniMax-H3 with active model-level CPU offload**: the
+pipeline moves each decoded output to the host on the reply rank as soon as that
+output reaches its final form -- audio inside `decode()`, and video in the
+callers of `decode()` right after `_prepare_minimax_h3_video_output` has
+quantized the frames to `uint8`. Other ranks replace it with a metadata-only
+tensor because their output is not consumed. This prevents a prior seed's
+decoded output from overlapping the DiT reload for the next seed in a
+multi-output request. The async envelope and SHM packing still run, but the main
+D2H copy has already happened before `COMPUTE_DONE`, so this path deliberately
+gives up D2H/next-forward overlap.
 
 ### Not Yet Supported (step-mode, `step_execution=True`)
 
@@ -171,7 +182,7 @@ Adapting step-mode requires additional design because:
 No configuration needed. Async output is automatically enabled when `step_execution=False` (default).
 
 | `step_execution` | Mode | Async Output | Pump Thread | Worker BG Thread |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | `False` (default) | request-mode | ✅ enabled | ✅ started | ✅ started |
 | `True` | step-mode | ❌ disabled | ❌ not started | ❌ not started |
 
