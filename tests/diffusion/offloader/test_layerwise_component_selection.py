@@ -18,6 +18,7 @@ from torch import nn
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.offloader.base import OffloadConfig
 from vllm_omni.diffusion.offloader.layerwise_backend import LayerWiseOffloadBackend
+from vllm_omni.diffusion.offloader.offload_plan import OffloadPlan
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.cpu, pytest.mark.core_model]
 
@@ -70,6 +71,35 @@ class _Pipeline(nn.Module):
         self.text_encoder = nn.Linear(2, 2)
 
 
+class _StageableComponent(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.proj = nn.Linear(2, 2)
+        self.offload_calls = 0
+        self.to_calls = 0
+
+    def offload_to_cpu(self) -> None:
+        self.offload_calls += 1
+
+    def to(self, *args, **kwargs):  # noqa: A003 - mirrors nn.Module.to
+        self.to_calls += 1
+        return super().to(*args, **kwargs)
+
+
+class _ComponentPipeline(nn.Module):
+    _dit_modules = ["transformer"]
+    _encoder_modules = ["text_encoder"]
+    _vae_modules = ["video_vae"]
+    _resident_modules = []
+    _offload_plan = OffloadPlan(on_demand_component_paths=frozenset({"text_encoder", "video_vae"}))
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.transformer = nn.Linear(2, 2)
+        self.text_encoder = _StageableComponent()
+        self.video_vae = _StageableComponent()
+
+
 def _backend(components: str | None) -> LayerWiseOffloadBackend:
     # Bypass __init__: it opens a device copy stream, which does not exist in a
     # CPU-only environment, and the excluded-DiT path never touches it.
@@ -80,6 +110,7 @@ def _backend(components: str | None) -> LayerWiseOffloadBackend:
     backend.device = torch.device("cpu")
     backend.enabled = False
     backend._blocks = []
+    backend._streamed_encoders = []
     return backend
 
 
@@ -94,6 +125,35 @@ def test_enable_keeps_excluded_dit_resident_without_hooks() -> None:
         "an excluded DiT must not receive block-streaming hooks"
     )
     assert backend._blocks == [], "no block group may be tracked for an excluded DiT"
+
+
+def test_enable_stages_only_selected_component_families(monkeypatch) -> None:
+    import vllm_omni.diffusion.offloader.layerwise_backend as backend_module
+
+    monkeypatch.setattr(backend_module, "stream_declared_encoder_blocks", lambda *args, **kwargs: False)
+    pipeline = _ComponentPipeline()
+
+    backend = _backend("vae")
+    backend.enable(pipeline)
+
+    assert pipeline.video_vae.offload_calls == 1
+    assert pipeline.video_vae.to_calls == 0
+    assert pipeline.text_encoder.offload_calls == 0
+    assert pipeline.text_encoder.to_calls == 1
+
+
+def test_enable_keeps_excluded_vae_family_resident(monkeypatch) -> None:
+    import vllm_omni.diffusion.offloader.layerwise_backend as backend_module
+
+    monkeypatch.setattr(backend_module, "stream_declared_encoder_blocks", lambda *args, **kwargs: False)
+    pipeline = _ComponentPipeline()
+
+    backend = _backend("text_encoder")
+    backend.enable(pipeline)
+
+    assert pipeline.text_encoder.offload_calls == 1
+    assert pipeline.video_vae.offload_calls == 0
+    assert pipeline.video_vae.to_calls == 1
 
 
 def test_serve_cli_registers_flag_and_carries_it_to_default_stage() -> None:
