@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -71,6 +71,99 @@ def test_requested_model_offload_without_backend_uses_resident_components():
     assert actual is expected
     pipeline.text_encoder.load_to_device.assert_called_once_with()
     pipeline.text_encoder.encode_ids.assert_called_once()
+
+
+def test_decoded_output_is_unchanged_without_active_model_offload():
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline._model_cpu_offload_modules = []
+    output = Mock()
+
+    assert pipeline._offload_model_cpu_stage_output(output) is output
+    output.cpu.assert_not_called()
+
+
+def test_reply_rank_copies_decoded_output_to_host(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline._model_cpu_offload_modules = [Mock()]
+    monkeypatch.setattr(pipeline, "_is_output_owner_rank", lambda: True)
+    output = Mock()
+    host_output = Mock()
+    output.cpu.return_value = host_output
+
+    assert pipeline._offload_model_cpu_stage_output(output) is host_output
+    output.cpu.assert_called_once_with()
+
+
+def test_non_reply_rank_drops_decoded_output_storage(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline._model_cpu_offload_modules = [Mock()]
+    monkeypatch.setattr(pipeline, "_is_output_owner_rank", lambda: False)
+    output = torch.ones((2, 3), dtype=torch.float16)
+
+    placeholder = pipeline._offload_model_cpu_stage_output(output)
+
+    assert placeholder.device.type == "meta"
+    assert placeholder.shape == output.shape
+    assert placeholder.dtype == output.dtype
+
+
+def test_decode_releases_both_stage_outputs_before_return(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as module
+
+    video = torch.ones((1, 1, 4, 4))
+    audio = torch.ones((1, 8))
+    pipeline = SimpleNamespace(
+        device=torch.device("cpu"),
+        video_vae=Mock(decode_latent=Mock(return_value=video)),
+        audio_vae=Mock(decode_latent=Mock(return_value=audio)),
+        _component_on_device=lambda component: nullcontext(),
+        _offload_model_cpu_stage_output=Mock(side_effect=lambda value: value),
+    )
+    monkeypatch.setattr(
+        module.current_omni_platform,
+        "create_autocast_context",
+        lambda **kwargs: nullcontext(),
+    )
+
+    actual_video, actual_audio = MiniMaxH3Pipeline.decode(
+        pipeline,
+        torch.zeros(1),
+        torch.zeros(1),
+        height=2,
+        width=3,
+    )
+
+    assert actual_video.shape[-2:] == (2, 3)
+    assert actual_audio is audio
+    calls = pipeline._offload_model_cpu_stage_output.call_args_list
+    assert len(calls) == 2
+    assert calls[0].args[0] is actual_video
+    assert calls[1].args[0] is audio
+
+
+@pytest.mark.parametrize(
+    ("available", "initialized", "rank", "expected"),
+    [(False, False, 7, True), (True, False, 7, True), (True, True, 0, True), (True, True, 1, False)],
+)
+def test_output_owner_rank_matches_executor_contract(monkeypatch, available, initialized, rank, expected):
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as module
+
+    monkeypatch.setattr(module.dist, "is_available", lambda: available)
+    monkeypatch.setattr(module.dist, "is_initialized", lambda: initialized)
+    monkeypatch.setattr(module.dist, "get_rank", lambda: rank)
+
+    assert MiniMaxH3Pipeline._is_output_owner_rank() is expected
 
 
 def test_h3_model_cpu_offload_registers_direct_vae_stages(monkeypatch):
