@@ -1306,6 +1306,26 @@ class MiniMaxH3Pipeline(
             if staged:
                 component.offload_to_cpu()
 
+    @staticmethod
+    def _is_output_owner_rank() -> bool:
+        """Whether this rank's output is returned by the diffusion executor."""
+        return not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0
+
+    def _offload_model_cpu_stage_output(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Release decoded output storage before a later seed reloads the DiT.
+
+        Model-level CPU offload makes the VAE hook evict the DiT before decode.
+        For a multi-output request, however, the next seed reloads the DiT while
+        the preceding decoded output would otherwise still occupy the device.
+        The reply rank performs the D2H copy early; ranks whose outputs are not
+        consumed retain only a metadata placeholder for the final concatenation.
+        """
+        if not getattr(self, "_model_cpu_offload_modules", None):
+            return tensor
+        if self._is_output_owner_rank():
+            return tensor.cpu()
+        return torch.empty(tensor.shape, dtype=tensor.dtype, device="meta")
+
     def _encode_visual_conditions(
         self,
         images: list[Image.Image],
@@ -1724,9 +1744,10 @@ class MiniMaxH3Pipeline(
                 enabled=True,
             ):
                 video = self.video_vae.decode_latent(video_latent)
-        video = video[..., :height, :width].contiguous()
+        video = self._offload_model_cpu_stage_output(video[..., :height, :width].contiguous())
         with self._component_on_device(self.audio_vae):
             audio = self.audio_vae.decode_latent(audio_latent)
+        audio = self._offload_model_cpu_stage_output(audio)
         return video, audio
 
     @torch.no_grad()

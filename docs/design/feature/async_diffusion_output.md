@@ -150,6 +150,14 @@ All models running in request-mode (`step_execution=False`, the default) automat
 
 Other models with `step_execution=False` are also supported but not yet verified.
 
+**Narrow exception -- MiniMax-H3 with active model-level CPU offload**: the
+pipeline moves each decoded output to the host inside `decode()` on the reply
+rank. Other ranks replace it with a metadata-only tensor because their output is
+not consumed. This prevents a prior seed's decoded output from overlapping the
+DiT reload for the next seed in a multi-output request. The async envelope and
+SHM packing still run, but the main D2H copy has already happened before
+`COMPUTE_DONE`, so this path deliberately gives up D2H/next-forward overlap.
+
 ### Not Yet Supported (step-mode, `step_execution=True`)
 
 When `step_execution=True` (or `streaming_output=True`, which auto-enables step-mode), models use `execute_stepwise` instead of `execute_model`, which is not in the async Path 1 whitelist. Async output is not applicable.
