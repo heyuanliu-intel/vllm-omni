@@ -129,6 +129,8 @@ from .npu.lora import (
     load_minimax_h3_native_lora,
 )
 from .packed_sequence import (
+    MINIMAX_H3_MAX_PAD_SEQ_LEN,
+    MINIMAX_H3_SEQ_ALIGN,
     minimax_h3_packed_sequence,
     minimax_h3_packed_sequence_ref2va_blocks,
 )
@@ -283,6 +285,7 @@ _MINIMAX_H3_DENOISE_INPUT_KEYS = (
     "visual_condition_shapes",
     "audio_condition_lengths",
     "keyframe_frame_indices",
+    "pad_seq_len",
 )
 
 # ``StepRequestState.extra`` keys owned by the step-execution path.
@@ -523,6 +526,28 @@ def _resolve_minimax_h3_num_outputs(value: Any) -> int:
     if not 1 <= value <= 10:
         raise OmniClientError(f"MiniMax H3 num_outputs_per_prompt must be in [1, 10], got {value}")
     return value
+
+
+def _resolve_pad_seq_len(value: object) -> int | None:
+    """Validate the optional packed-length pin from ``extra_args``.
+
+    The packer itself only needs a value that covers the used rows. A request
+    field needs two more guards: an unaligned value would silently open yet
+    another compiled shape, and an unbounded one would size every structural
+    tensor the packer allocates.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+        raise OmniClientError("MiniMax H3 pad_seq_len must be an integer")
+    pinned = int(value)
+    if pinned <= 0:
+        raise OmniClientError(f"MiniMax H3 pad_seq_len must be positive, got {pinned}")
+    if pinned % MINIMAX_H3_SEQ_ALIGN:
+        raise OmniClientError(f"MiniMax H3 pad_seq_len must be a multiple of {MINIMAX_H3_SEQ_ALIGN}, got {pinned}")
+    if pinned > MINIMAX_H3_MAX_PAD_SEQ_LEN:
+        raise OmniClientError(f"MiniMax H3 pad_seq_len must be at most {MINIMAX_H3_MAX_PAD_SEQ_LEN}, got {pinned}")
+    return pinned
 
 
 def _minimax_h3_output_seeds(seed: int, num_outputs: int) -> list[int]:
@@ -1912,6 +1937,7 @@ class MiniMaxH3Pipeline(
         visual_condition_shapes: list[tuple[int, int, int]] | None = None,
         audio_condition_lengths: list[int] | None = None,
         keyframe_frame_indices: list[int] | None = None,
+        pad_seq_len: int | None = None,
     ) -> dict[str, Any]:
         """Build the packed layout, initial rows, anchors, and sigma schedules.
 
@@ -1941,6 +1967,7 @@ class MiniMaxH3Pipeline(
                 latent_w=latent_w,
                 audio_t=audio_t,
                 ref_blocks=ref_blocks,
+                seq_len=pad_seq_len,
             )
         else:
             packed = minimax_h3_packed_sequence(
@@ -1952,7 +1979,19 @@ class MiniMaxH3Pipeline(
                 include_keyframe_cond=task == "fl2va",
                 keyframe_frame_indices=keyframe_frame_indices if task == "fl2va" else None,
                 frame_count=num_frames if task == "fl2va" else None,
+                seq_len=pad_seq_len,
             )
+        # Report the effective shape at info level exactly when a request pins
+        # it, so a deployment can confirm the pin landed without raising the
+        # log level for every request.
+        log = logger.info if pad_seq_len is not None else logger.debug
+        log(
+            "MiniMax H3 packed sequence: task=%s pad_seq_len=%s used=%d seq_len=%d",
+            task,
+            pad_seq_len,
+            int(packed["cu_seqlens"][1]),
+            int(packed["seq_len"]),
+        )
 
         tags = packed["token_tags"].clone()
         tags[packed["text_pos"]] = text_tags.cpu()
@@ -2088,6 +2127,7 @@ class MiniMaxH3Pipeline(
         visual_condition_shapes: list[tuple[int, int, int]] | None = None,
         audio_condition_lengths: list[int] | None = None,
         keyframe_frame_indices: list[int] | None = None,
+        pad_seq_len: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         inputs = self._build_denoise_inputs(
             task=task,
@@ -2111,6 +2151,7 @@ class MiniMaxH3Pipeline(
             visual_condition_shapes=visual_condition_shapes,
             audio_condition_lengths=audio_condition_lengths,
             keyframe_frame_indices=keyframe_frame_indices,
+            pad_seq_len=pad_seq_len,
         )
         branch = inputs["branch"]
         transformer = self._transformer_for_task(task)
@@ -2462,6 +2503,7 @@ class MiniMaxH3Pipeline(
         base_schedule, num_steps = self._resolve_sigma_positions(task, sampling)
         video_shift = float(extra.get("flow_shift", self.default_video_shift))
         audio_shift = float(extra.get("audio_flow_shift", self.default_audio_shift))
+        pad_seq_len = _resolve_pad_seq_len(extra.get("pad_seq_len"))
         quality_plan = self._quality_policy.resolve(
             quality=quality,
             num_inference_steps=num_steps,
@@ -2488,6 +2530,7 @@ class MiniMaxH3Pipeline(
             "visual_condition_shapes": visual_shapes,
             "audio_condition_lengths": audio_lengths,
             "keyframe_frame_indices": keyframe_frame_indices,
+            "pad_seq_len": pad_seq_len,
             "seed": seed,
             "num_steps": num_steps,
             "video_shift": video_shift,
