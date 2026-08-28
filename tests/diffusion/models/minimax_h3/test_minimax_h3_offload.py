@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -8,6 +8,8 @@ from unittest.mock import Mock
 import pytest
 import torch
 from PIL import Image
+
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -29,7 +31,7 @@ def test_manual_component_offload_wins_over_requested_model_offload(distributed)
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
-    pipeline.od_config = SimpleNamespace(
+    pipeline.od_config = OmniDiffusionConfig(
         enable_cpu_offload=True,
         enable_layerwise_offload=not distributed,
         enable_distributed_layerwise_offload=distributed,
@@ -41,7 +43,7 @@ def test_manual_component_offload_wins_over_requested_model_offload(distributed)
     component = Mock()
 
     actual = pipeline._encode_text_hidden(torch.tensor([1, 2]), {})
-    with pipeline._component_on_device(component):
+    with pipeline._component_on_device(component, family="vae"):
         component.load_to_device.assert_called_once_with()
         component.offload_to_cpu.assert_not_called()
 
@@ -133,7 +135,7 @@ def test_h3_model_cpu_offload_scopes_direct_vae_call(monkeypatch, decode_fails):
     pipeline._model_cpu_offload_modules = [component]
 
     def decode():
-        with pipeline._component_on_device(component):
+        with pipeline._component_on_device(component, family="vae"):
             events.append(("decode", component))
             if decode_fails:
                 raise RuntimeError("decode failed")
@@ -306,3 +308,115 @@ def test_h3_model_cpu_offload_shares_embedded_and_standalone_audio_scope(monkeyp
     assert events[-1] == ("offload", pipeline.audio_vae)
     assert events.count(("activate", pipeline.audio_vae)) == 1
     assert events.count(("offload", pipeline.audio_vae)) == 1
+
+
+# ---------------------------------------------------------------------------
+# Layer-wise component selection: the pipeline side of the contract.
+#
+# ``--layerwise-offload-components`` names the families the layer-wise backend
+# may manage; a family left out stays fully device-resident. This pipeline
+# stages the encoders and VAEs itself, so it has to read the same selection --
+# otherwise it drags an unselected family back to the host after every use and
+# the placement the backend published never holds.
+# ---------------------------------------------------------------------------
+
+
+def _residency_pipeline(**od_kwargs):
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.od_config = OmniDiffusionConfig(**od_kwargs)
+    pipeline._model_cpu_offload_modules = []
+    pipeline.device = torch.device("cpu")
+    return pipeline
+
+
+def test_unselected_vae_family_is_not_staged():
+    pipeline = _residency_pipeline(
+        enable_layerwise_offload=True,
+        layerwise_offload_components="dit,text_encoder",
+    )
+    component = Mock()
+
+    with pipeline._component_on_device(component, family="vae"):
+        pass
+
+    assert pipeline._stages_component_family("vae") is False
+    component.load_to_device.assert_not_called()
+    component.offload_to_cpu.assert_not_called()
+
+
+def test_unselected_vae_family_is_built_on_the_device():
+    pipeline = _residency_pipeline(
+        enable_layerwise_offload=True,
+        layerwise_offload_components="dit,text_encoder",
+    )
+
+    # Constructing on the host would only buy a start-up host-to-device
+    # transfer for weights the backend then keeps resident.
+    assert pipeline._vae_load_device() == pipeline.device
+
+
+def test_default_selection_still_stages_every_family():
+    # The lock on "default behavior is byte-for-byte unchanged": omitting the
+    # option selects every family, so both sites behave exactly as before.
+    pipeline = _residency_pipeline(enable_layerwise_offload=True)
+    component = Mock()
+
+    with pipeline._component_on_device(component, family="vae"):
+        component.load_to_device.assert_called_once_with()
+        component.offload_to_cpu.assert_not_called()
+
+    component.offload_to_cpu.assert_called_once_with()
+    assert pipeline._stages_component_family("text_encoder") is True
+    assert pipeline._vae_load_device() == torch.device("cpu")
+
+
+def test_distributed_layerwise_stages_families_the_selection_omits():
+    # Distributed layer-wise offload shards every component it manages; its
+    # residency does not go through the plain-layerwise selection.
+    pipeline = _residency_pipeline(
+        enable_distributed_layerwise_offload=True,
+        layerwise_offload_components="dit",
+    )
+    component = Mock()
+
+    with pipeline._component_on_device(component, family="vae"):
+        component.load_to_device.assert_called_once_with()
+
+    component.offload_to_cpu.assert_called_once_with()
+    assert pipeline._vae_load_device() == torch.device("cpu")
+
+
+def test_unselected_text_encoder_family_skips_the_host_round_trip():
+    pipeline = _residency_pipeline(
+        enable_layerwise_offload=True,
+        layerwise_offload_components="dit,vae",
+    )
+    pipeline.text_encoder = Mock()
+    expected = torch.ones(2, 3)
+    pipeline.text_encoder.encode_ids.return_value = expected
+
+    actual = pipeline._encode_text_hidden(torch.tensor([1, 2]), {})
+
+    assert actual is expected
+    # Resident: loaded once, never pushed back to the host.
+    pipeline.text_encoder.load_to_device.assert_called_once_with()
+    pipeline.text_encoder.offload_to_cpu.assert_not_called()
+
+
+def test_selected_text_encoder_family_keeps_the_host_round_trip():
+    pipeline = _residency_pipeline(
+        enable_layerwise_offload=True,
+        layerwise_offload_components="dit,text_encoder",
+    )
+    pipeline.text_encoder = Mock()
+    expected = torch.ones(2, 3)
+    pipeline.text_encoder.encode_ids.return_value = expected
+
+    actual = pipeline._encode_text_hidden(torch.tensor([1, 2]), {})
+
+    assert actual is expected
+    pipeline.text_encoder.load_to_device.assert_called_once_with()
+    pipeline.text_encoder.offload_to_cpu.assert_called_once_with()

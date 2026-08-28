@@ -476,9 +476,19 @@ class LayerWiseOffloadBackend(OffloadBackend):
         # the pipeline declares as on-demand is parked in host memory and left to
         # the pipeline's own load/release lifecycle, and everything else is made
         # resident.
+        #
+        # Both of those behaviours are managing the encoder family, so they only
+        # run when the selection names it. With "text_encoder" excluded the
+        # encoders are simply placed on the device, which is what a backend that
+        # does not manage them must do.
+        selection = self.config.layerwise_components
         plan = get_offload_plan(pipeline)
         declared_on_demand = plan.on_demand_component_paths if plan is not None else frozenset()
+        manage_encoders = "text_encoder" in selection
         for enc, enc_name in zip(modules.encoders, modules.encoder_names):
+            if not manage_encoders:
+                enc.to(self.device)
+                continue
             if stream_declared_encoder_blocks(enc, enc_name, plan, self.device, pin_memory=self.config.pin_cpu_memory):
                 self._streamed_encoders.append(enc)
             offload_to_cpu = getattr(enc, "offload_to_cpu", None)
@@ -486,6 +496,12 @@ class LayerWiseOffloadBackend(OffloadBackend):
                 offload_to_cpu()
             else:
                 enc.to(self.device)
+        if not manage_encoders and modules.encoder_names:
+            logger.info(
+                "Layer-wise offload components=%s: encoder(s) %s stay fully device-resident",
+                sorted(selection),
+                modules.encoder_names,
+            )
 
         # A pipeline that declares a component in ``on_demand_component_paths``
         # loads it before use and releases it afterwards, so it owns that
@@ -500,12 +516,16 @@ class LayerWiseOffloadBackend(OffloadBackend):
         # post-forward hook is installed here: it would disrupt the DiT
         # prefetch streams. ``offload_to_cpu()`` is idempotent, so confirming
         # the placement stays correct even if something else moved the weights.
-        plan = get_offload_plan(pipeline)
+        #
+        # Parking is this backend managing the VAE family, so it only runs when
+        # the selection names it. With "vae" excluded every VAE is made resident
+        # exactly as a backend that does not manage them would.
         declared = plan.on_demand_component_paths if plan is not None else frozenset()
+        manage_vaes = "vae" in selection
         staged_vaes, staged_names, resident_vaes = [], [], []
         for vae, name in zip(modules.vaes, modules.vae_names):
             offload_to_cpu = getattr(vae, "offload_to_cpu", None)
-            if name in declared and callable(offload_to_cpu):
+            if manage_vaes and name in declared and callable(offload_to_cpu):
                 staged_vaes.append(offload_to_cpu)
                 staged_names.append(name)
             else:
@@ -516,6 +536,13 @@ class LayerWiseOffloadBackend(OffloadBackend):
             logger.info(
                 "Layer-wise offloading leaves the pipeline-staged VAE(s) in host memory: %s",
                 ", ".join(staged_names),
+            )
+
+        if not manage_vaes and modules.vae_names:
+            logger.info(
+                "Layer-wise offload components=%s: VAE(s) %s stay fully device-resident",
+                sorted(selection),
+                modules.vae_names,
             )
 
         # Move VAE(s) to GPU if available
@@ -538,7 +565,6 @@ class LayerWiseOffloadBackend(OffloadBackend):
         # the device and only the other components are offloaded, instead of
         # paying the per-block streaming cost on the component that dominates
         # step time.
-        selection = self.config.layerwise_components
         if "dit" not in selection:
             for dit_name, dit_module in zip(modules.dit_names, modules.dits):
                 dit_module.to(self.device)
