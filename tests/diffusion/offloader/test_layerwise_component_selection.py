@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Layer-wise offloading must honor the component-family selection.
 
@@ -61,13 +61,58 @@ def test_offload_config_defaults_to_every_family() -> None:
 class _Pipeline(nn.Module):
     _dit_modules = ["transformer"]
     _encoder_modules = ["text_encoder"]
-    _vae_modules = []
-    _resident_modules = []
+    _vae_modules: list[str] = []
+    _resident_modules: list[str] = []
 
     def __init__(self) -> None:
         super().__init__()
         self.transformer = nn.Linear(2, 2)
         self.text_encoder = nn.Linear(2, 2)
+
+
+class _Staged(nn.Module):
+    """A component whose pipeline loads and releases it around each use."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.blocks = nn.ModuleList([nn.Linear(2, 2), nn.Linear(2, 2)])
+        self.norm = nn.Linear(2, 2)
+        self.moves: list[str] = []
+
+    def to(self, *args, **kwargs):  # noqa: A003 - mirrors nn.Module.to
+        self.moves.append("to")
+        return super().to(*args, **kwargs)
+
+    def offload_to_cpu(self) -> None:
+        self.moves.append("offload")
+
+
+def _staged_pipeline(encoder: nn.Module, vae: nn.Module) -> nn.Module:
+    """A pipeline that would trigger encoder streaming and VAE parking.
+
+    It declares both components on-demand and declares the encoder's block
+    stack, so with the family selected the backend parks them in host memory.
+    That is exactly what the selection gate has to suppress.
+    """
+    from vllm_omni.diffusion.offloader.offload_plan import OffloadPlan
+
+    class Pipeline(nn.Module):
+        _dit_modules = ["transformer"]
+        _encoder_modules = ["text_encoder"]
+        _vae_modules = ["vae"]
+        _resident_modules: list[str] = []
+        _offload_plan = OffloadPlan(
+            encoder_block_attrs={"text_encoder": ("blocks",)},
+            on_demand_component_paths=frozenset({"text_encoder", "vae"}),
+        )
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.transformer = nn.Linear(2, 2)
+            self.text_encoder = encoder
+            self.vae = vae
+
+    return Pipeline()
 
 
 def _backend(components: str | None) -> LayerWiseOffloadBackend:
@@ -80,6 +125,7 @@ def _backend(components: str | None) -> LayerWiseOffloadBackend:
     backend.device = torch.device("cpu")
     backend.enabled = False
     backend._blocks = []
+    backend._streamed_encoders = []
     return backend
 
 
@@ -107,9 +153,7 @@ def test_serve_cli_registers_flag_and_carries_it_to_default_stage() -> None:
     subparsers = parser.add_subparsers(dest="subcommand")
     OmniServeCommand().subparser_init(subparsers)
 
-    args = parser.parse_args(
-        ["serve", "fake-model", "--omni", "--layerwise-offload-components", "text_encoder,vae"]
-    )
+    args = parser.parse_args(["serve", "fake-model", "--omni", "--layerwise-offload-components", "text_encoder,vae"])
     explicit = args.get_explicit_kwargs_dict()
     assert explicit["layerwise_offload_components"] == "text_encoder,vae"
 
@@ -125,9 +169,7 @@ def test_typed_deploy_chain_carries_selection_to_projection() -> None:
     from vllm_omni.config.omni_config import _DiffusionConfigProjection, _stage_engine_overrides
     from vllm_omni.config.stage_config import StageDeployConfig
 
-    overrides = _stage_engine_overrides(
-        StageDeployConfig(stage_id=0, layerwise_offload_components="text_encoder,vae")
-    )
+    overrides = _stage_engine_overrides(StageDeployConfig(stage_id=0, layerwise_offload_components="text_encoder,vae"))
     assert overrides["layerwise_offload_components"] == "text_encoder,vae"
 
     projection = _DiffusionConfigProjection.from_kwargs(**overrides)
@@ -135,3 +177,42 @@ def test_typed_deploy_chain_carries_selection_to_projection() -> None:
 
     empty = _DiffusionConfigProjection.from_kwargs(**_stage_engine_overrides(StageDeployConfig(stage_id=0)))
     assert empty.layerwise_offload_components is None
+
+
+def test_enable_leaves_an_excluded_encoder_family_untouched() -> None:
+    """ "text_encoder" excluded: no streaming, no parking, just resident.
+
+    With the family selected this same pipeline would have its encoder blocks
+    streamed and the encoder parked in host memory (it declares both). Excluding
+    the family must produce the behaviour of a backend that does not manage
+    encoders at all: a plain placement onto the device.
+    """
+    encoder, vae = _Staged(), _Staged()
+    backend = _backend("dit,vae")
+
+    backend.enable(_staged_pipeline(encoder, vae))
+
+    assert "offload" not in encoder.moves, "an excluded encoder must not be parked in host memory"
+    assert encoder.moves == ["to"], f"an excluded encoder must only be placed, got {encoder.moves}"
+    assert backend._streamed_encoders == [], "an excluded encoder must not have its blocks streamed"
+    assert getattr(encoder, "_omni_layerwise_blocks", None) is None, (
+        "an excluded encoder must not carry block-streaming state"
+    )
+    backend.disable()
+
+
+def test_enable_leaves_an_excluded_vae_family_untouched() -> None:
+    """ "vae" excluded: the declared, stageable VAE is made resident instead.
+
+    With the family selected this VAE is parked (it is declared on-demand and
+    exposes ``offload_to_cpu``). Excluding the family must fall back to the
+    plain resident placement.
+    """
+    encoder, vae = _Staged(), _Staged()
+    backend = _backend("dit,text_encoder")
+
+    backend.enable(_staged_pipeline(encoder, vae))
+
+    assert "offload" not in vae.moves, "an excluded VAE must not be parked in host memory"
+    assert vae.moves == ["to"], f"an excluded VAE must only be placed, got {vae.moves}"
+    backend.disable()

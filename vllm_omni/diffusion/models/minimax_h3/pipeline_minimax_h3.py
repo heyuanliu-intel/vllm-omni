@@ -1059,10 +1059,8 @@ class MiniMaxH3Pipeline(
             self.text_encoder_group = None
             self.text_encoder = None
             self._encoder_modules = []
-        stage_components = bool(
-            od_config.enable_layerwise_offload or getattr(od_config, "enable_distributed_layerwise_offload", False)
-        )
-        component_load_device = torch.device("cpu") if stage_components else self.device
+        stage_vaes = self._stages_component_family("vae")
+        component_load_device = self._vae_load_device()
         self.video_vae = MiniMaxH3VideoVAE(
             os.path.join(model_path, "video_vae"),
             device=self.device,
@@ -1077,6 +1075,21 @@ class MiniMaxH3Pipeline(
         )
         # Registry-side VAE patch-parallel discovery uses ``pipeline.vae``.
         self.vae = self.video_vae
+
+        # Self-witness at the decision point, with the quantities that decided
+        # it: which families were selected, what each site concluded, and where
+        # the VAE weights actually landed. "No error at startup" does not show
+        # that the selection reached these sites.
+        logger.info(
+            "MiniMax-H3 component residency: layerwise=%s distributed_layerwise=%s selection=%s "
+            "vae_staged=%s text_encoder_staged=%s vae_load_device=%s",
+            bool(od_config.enable_layerwise_offload),
+            bool(getattr(od_config, "enable_distributed_layerwise_offload", False)),
+            sorted(od_config.layerwise_component_selection()),
+            stage_vaes,
+            self._stages_component_family("text_encoder"),
+            component_load_device,
+        )
 
         self._dlo_component_cache = None
         if getattr(od_config, "enable_distributed_layerwise_offload", False):
@@ -1550,12 +1563,10 @@ class MiniMaxH3Pipeline(
             # swaps the resident DiT and encoder.
             return self.text_encoder(input_ids, **vision_kwargs)
 
-        if self.od_config.enable_layerwise_offload or getattr(
-            self.od_config, "enable_distributed_layerwise_offload", False
-        ):
+        if self._stages_component_family("text_encoder"):
             # Layerwise DiT offload already provides the low-residency encoder
             # phase used by the checkpoint reference.
-            with self._component_on_device(self.text_encoder):
+            with self._component_on_device(self.text_encoder, family="text_encoder"):
                 return self.text_encoder.encode_ids(input_ids, **vision_kwargs)
 
         # Keep both Qwen and DiT resident across requests. Moving either model
@@ -1564,12 +1575,34 @@ class MiniMaxH3Pipeline(
         self.text_encoder.load_to_device()
         return self.text_encoder.encode_ids(input_ids, **vision_kwargs)
 
-    def _uses_manual_component_offload(self) -> bool:
+    def _vae_load_device(self) -> torch.device:
+        """Where the VAE weights are materialized at construction.
+
+        Building them on the host only pays off when this pipeline is the side
+        that stages them. When ``vae`` is left out of the selection the backend
+        places them on the device, and constructing on the host would only add
+        a start-up host-to-device transfer of weights that then stay resident.
+        """
+
+        return torch.device("cpu") if self._stages_component_family("vae") else self.device
+
+    def _stages_component_family(self, family: str) -> bool:
+        """Whether this pipeline host-stages ``family`` between uses.
+
+        Distributed layer-wise offload stages every family it manages. Plain
+        layer-wise offload stages only the families named by
+        ``--layerwise-offload-components``: a family left out stays fully
+        device-resident, which is the contract the backend publishes as
+        ``OffloadConfig.layerwise_components``. Staging an unselected family
+        here would undo that placement and pay a host round trip per use.
+        """
+
         od_config = getattr(self, "od_config", None)
-        return bool(
-            getattr(od_config, "enable_layerwise_offload", False)
-            or getattr(od_config, "enable_distributed_layerwise_offload", False)
-        )
+        if getattr(od_config, "enable_distributed_layerwise_offload", False):
+            return True
+        if not getattr(od_config, "enable_layerwise_offload", False):
+            return False
+        return family in od_config.layerwise_component_selection()
 
     def enable_omni_model_cpu_offload(
         self,
@@ -1618,12 +1651,12 @@ class MiniMaxH3Pipeline(
         self._model_cpu_offload_modules = []
 
     @contextmanager
-    def _component_on_device(self, component: nn.Module):
+    def _component_on_device(self, component: nn.Module, *, family: str):
         if getattr(self, "_model_cpu_offload_modules", None):
             with sequential_offload_component(component):
                 yield
             return
-        staged = self._uses_manual_component_offload()
+        staged = self._stages_component_family(family)
         try:
             if staged:
                 component.load_to_device()
@@ -1692,7 +1725,9 @@ class MiniMaxH3Pipeline(
         # Keep image and video references in one residency window when both
         # appear in a request; otherwise the video branch would reload the VAE.
         needs_video_vae = video_count > 0 or (rank == 0 and bool(images))
-        video_vae_context = self._component_on_device(self.video_vae) if needs_video_vae else nullcontext()
+        video_vae_context = (
+            self._component_on_device(self.video_vae, family="vae") if needs_video_vae else nullcontext()
+        )
         with video_vae_context:
             if images:
                 image_rows = None
@@ -1853,7 +1888,9 @@ class MiniMaxH3Pipeline(
         # Embedded and standalone audio are consecutive direct Audio-VAE
         # calls. Keep the component resident across both paths.
         needs_audio_vae = any(has_audio) or bool(standalone_audios)
-        audio_vae_context = self._component_on_device(self.audio_vae) if needs_audio_vae else nullcontext()
+        audio_vae_context = (
+            self._component_on_device(self.audio_vae, family="vae") if needs_audio_vae else nullcontext()
+        )
         with audio_vae_context:
             embedded_condition, embedded_lengths = self._encode_video_audio_conditions_resident(
                 prepared_videos,
@@ -2190,7 +2227,7 @@ class MiniMaxH3Pipeline(
         height: int,
         width: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        with self._component_on_device(self.video_vae):
+        with self._component_on_device(self.video_vae, family="vae"):
             with current_omni_platform.create_autocast_context(
                 device_type=self.device.type,
                 dtype=torch.float16,
@@ -2198,7 +2235,7 @@ class MiniMaxH3Pipeline(
             ):
                 video = self.video_vae.decode_latent(video_latent)
         video = video[..., :height, :width].contiguous()
-        with self._component_on_device(self.audio_vae):
+        with self._component_on_device(self.audio_vae, family="vae"):
             audio = self.audio_vae.decode_latent(audio_latent)
         audio = self._offload_model_cpu_stage_output(audio)
         return video, audio

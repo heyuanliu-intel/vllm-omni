@@ -53,9 +53,23 @@ vllm serve MODEL --omni --enable-layerwise-offload \
 
 The value is a non-empty comma-separated list drawn from `dit`,
 `text_encoder`, and `vae`; unknown names fail configuration validation.
-Leaving `dit` out keeps the complete DiT device-resident and installs no DiT
-streaming hooks. Encoder and VAE selection applies to pipelines that declare
-the corresponding layerwise streaming or staging capability.
+Every family is gated the same way in the backend:
+
+- `dit` left out: the complete DiT stays device-resident and no DiT streaming
+  hooks are installed.
+- `text_encoder` left out: encoders are placed on the device and nothing else
+  is done to them -- no block streaming and no host parking, *even if the
+  pipeline declares an encoder block stack or declares the encoder on-demand*.
+- `vae` left out: VAEs are placed on the device, *even if the pipeline declares
+  the VAE on-demand and it exposes `offload_to_cpu()`*.
+
+A family left out of the selection stays fully device-resident, and that is a
+contract on both sides. A pipeline that manages its own encoder or VAE
+residency must read the selection before it host-stages a component:
+otherwise the backend places an unselected component on the device and the
+pipeline pulls it back after every use, paying a host round trip for weights
+the operator asked to keep resident. `MiniMaxH3Pipeline._stages_component_family`
+is the reference implementation.
 
 ## Model integration
 

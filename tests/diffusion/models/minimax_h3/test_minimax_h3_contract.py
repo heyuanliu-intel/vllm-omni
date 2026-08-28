@@ -13,6 +13,8 @@ import pytest
 import torch
 import torch.nn as nn
 
+from vllm_omni.diffusion.data import OmniDiffusionConfig
+
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 _ItemT = TypeVar("_ItemT")
@@ -1383,7 +1385,7 @@ def test_layerwise_offload_releases_text_encoder(offload_flag):
 
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
-    pipeline.od_config = SimpleNamespace(
+    pipeline.od_config = OmniDiffusionConfig(
         enable_cpu_offload=False,
         enable_layerwise_offload=False,
         enable_distributed_layerwise_offload=False,
@@ -1432,7 +1434,7 @@ def test_distributed_layerwise_offload_stages_vae_component():
     )
     component = Mock()
 
-    with pipeline._component_on_device(component):
+    with pipeline._component_on_device(component, family="vae"):
         component.load_to_device.assert_called_once_with()
         component.offload_to_cpu.assert_not_called()
 

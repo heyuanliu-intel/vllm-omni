@@ -476,9 +476,19 @@ class LayerWiseOffloadBackend(OffloadBackend):
         # the pipeline declares as on-demand is parked in host memory and left to
         # the pipeline's own load/release lifecycle, and everything else is made
         # resident.
+        #
+        # Both of those behaviours are managing the encoder family, so they only
+        # run when the selection names it. With "text_encoder" excluded the
+        # encoders are simply placed on the device, which is what a backend that
+        # does not manage them must do.
+        selection = self.config.layerwise_components
         plan = get_offload_plan(pipeline)
         declared_on_demand = plan.on_demand_component_paths if plan is not None else frozenset()
+        manage_encoders = "text_encoder" in selection
         for enc, enc_name in zip(modules.encoders, modules.encoder_names):
+            if not manage_encoders:
+                enc.to(self.device)
+                continue
             if stream_declared_encoder_blocks(enc, enc_name, plan, self.device, pin_memory=self.config.pin_cpu_memory):
                 self._streamed_encoders.append(enc)
             offload_to_cpu = getattr(enc, "offload_to_cpu", None)
@@ -486,6 +496,12 @@ class LayerWiseOffloadBackend(OffloadBackend):
                 offload_to_cpu()
             else:
                 enc.to(self.device)
+        if not manage_encoders and modules.encoder_names:
+            logger.info(
+                "Layer-wise offload components=%s: encoder(s) %s stay fully device-resident",
+                sorted(selection),
+                modules.encoder_names,
+            )
 
         # Move VAE(s) to GPU if available
         for vae in modules.vaes:
@@ -507,7 +523,6 @@ class LayerWiseOffloadBackend(OffloadBackend):
         # the device and only the other components are offloaded, instead of
         # paying the per-block streaming cost on the component that dominates
         # step time.
-        selection = self.config.layerwise_components
         if "dit" not in selection:
             for dit_name, dit_module in zip(modules.dit_names, modules.dits):
                 dit_module.to(self.device)
