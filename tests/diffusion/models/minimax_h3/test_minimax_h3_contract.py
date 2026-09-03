@@ -111,7 +111,7 @@ def test_pipeline_import_registry_and_component_discovery():
     )
     assert MiniMaxH3Pipeline._dit_modules == ["transformer", "transformers_ref"]
     assert MiniMaxH3Pipeline._encoder_modules == ["text_encoder"]
-    assert MiniMaxH3Pipeline._vae_modules == ["video_vae", "audio_vae"]
+    assert MiniMaxH3Pipeline._vae_modules == []
 
 
 def test_encoder_free_stage_skips_text_encoder_during_dlo_discovery():
@@ -126,13 +126,14 @@ def test_encoder_free_stage_skips_text_encoder_during_dlo_discovery():
     pipeline.text_encoder = None
     pipeline._dit_modules = ["transformer"]
     pipeline._encoder_modules = []
-    pipeline._vae_modules = ["video_vae", "audio_vae"]
 
     discovered = ModuleDiscovery.discover(pipeline)
 
     assert discovered.dit_names == ["transformer"]
     assert discovered.encoder_names == []
-    assert discovered.vae_names == ["video_vae", "audio_vae"]
+    # The pipeline stages both VAEs itself, so discovery must not report them.
+    assert discovered.vaes == []
+    assert discovered.vae_names == []
 
 
 def test_encoder_free_stage_skips_missing_component_during_dlo_registration():

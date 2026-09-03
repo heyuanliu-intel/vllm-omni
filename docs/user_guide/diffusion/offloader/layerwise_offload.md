@@ -19,7 +19,8 @@ stream.
 | last block | Prefetch block 0 | Compute last block | Free last block |
 
 Encoders, VAE modules, and non-block DiT modules such as embeddings and norms
-remain device resident.
+remain device resident. Components that a pipeline stages by itself are kept out
+of component discovery, so layer-wise offloading never relocates them.
 
 ## Usage
 
