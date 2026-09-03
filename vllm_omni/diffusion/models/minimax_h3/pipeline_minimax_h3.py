@@ -664,12 +664,16 @@ class MiniMaxH3Pipeline(
 
     _dit_modules: ClassVar[list[str]] = ["transformer", "transformers_ref"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
-    _vae_modules: ClassVar[list[str]] = ["video_vae", "audio_vae"]
+    # The video and audio VAEs are staged by the pipeline itself: it calls
+    # ``load_to_device()`` / ``offload_to_cpu()`` around every encode and decode.
+    # They are therefore deliberately kept out of component discovery so that no
+    # offload backend or model loader relocates them behind the pipeline's back.
+    _vae_modules: ClassVar[list[str]] = []
     _offload_plan: ClassVar[OffloadPlan] = OffloadPlan(
         offload_submodules={"token_refiner": "blocks"},
         resident_dit_paths=frozenset({"transformer"}),
         encoder_block_attrs={"text_encoder": ("vision.blocks", "text_model.layers")},
-        on_demand_component_paths=frozenset({"text_encoder", "video_vae", "audio_vae"}),
+        on_demand_component_paths=frozenset({"text_encoder"}),
     )
     _PROFILER_TARGETS: ClassVar[list[str]] = [
         "_prepare_reference_videos",
@@ -1552,7 +1556,17 @@ class MiniMaxH3Pipeline(
 
         components = ModuleDiscovery.discover(self)
         dits = components.dits
-        stages = [*components.encoders, *components.vaes]
+        # The VAEs are intentionally absent from component discovery, so the
+        # model-level offload stages are listed explicitly here.
+        stages = [
+            component
+            for component in (
+                getattr(self, "text_encoder", None),
+                getattr(self, "video_vae", None),
+                getattr(self, "audio_vae", None),
+            )
+            if component is not None
+        ]
         modules = [*dits, *stages]
         apply_sequential_offload(
             dit_modules=dits,

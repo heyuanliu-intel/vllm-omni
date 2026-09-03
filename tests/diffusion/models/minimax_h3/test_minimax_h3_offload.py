@@ -306,3 +306,65 @@ def test_h3_model_cpu_offload_shares_embedded_and_standalone_audio_scope(monkeyp
     assert events[-1] == ("offload", pipeline.audio_vae)
     assert events.count(("activate", pipeline.audio_vae)) == 1
     assert events.count(("offload", pipeline.audio_vae)) == 1
+
+
+class _RecordingVAE(torch.nn.Module):
+    """Stand-in VAE that records every device relocation requested on it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.linear = torch.nn.Linear(2, 2)
+        self.to_calls: list[tuple] = []
+
+    def to(self, *args, **kwargs):
+        self.to_calls.append((args, kwargs))
+        return super().to(*args, **kwargs)
+
+
+def test_layerwise_backend_does_not_touch_pipeline_staged_vaes(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+    from vllm_omni.diffusion.offloader import layerwise_backend as layerwise_backend_module
+    from vllm_omni.diffusion.offloader.base import OffloadConfig, OffloadStrategy
+    from vllm_omni.diffusion.offloader.layerwise_backend import LayerWiseOffloadBackend
+    from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
+
+    class _Stream:
+        def wait_stream(self, _stream) -> None:
+            return None
+
+        def wait_event(self, _event) -> None:
+            return None
+
+    monkeypatch.setattr(layerwise_backend_module.current_omni_platform, "Stream", lambda: _Stream())
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.transformer = torch.nn.Linear(2, 2)
+    pipeline.text_encoder = None
+    pipeline.video_vae = _RecordingVAE()
+    pipeline.audio_vae = _RecordingVAE()
+    # Registry-side VAE patch parallelism aliases the video VAE; it must not
+    # become a discovery attribute either.
+    pipeline.vae = pipeline.video_vae
+    pipeline._dit_modules = ["transformer"]
+    pipeline._encoder_modules = []
+
+    backend = LayerWiseOffloadBackend(
+        OffloadConfig(strategy=OffloadStrategy.LAYER_WISE, pin_cpu_memory=False),
+        device=torch.device("cpu"),
+    )
+    backend.enable(pipeline)
+
+    assert pipeline.video_vae.to_calls == []
+    assert pipeline.audio_vae.to_calls == []
+
+    discovered = ModuleDiscovery.discover(pipeline)
+    assert discovered.vaes == []
+    assert discovered.vae_names == []
+
+
+def test_h3_offload_plan_does_not_stage_vaes_on_demand():
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    plan = MiniMaxH3Pipeline._offload_plan
+    assert plan.on_demand_component_paths == frozenset({"text_encoder"})
