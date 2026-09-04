@@ -720,7 +720,9 @@ class OmniServeCommand(CLISubcommand):
             help=(
                 "Comma-separated component families that plain layerwise "
                 "offloading may manage, drawn from {dit, text_encoder, vae}. "
-                "The default selects every family."
+                "The default selects every family. Pipeline-staged VAEs are "
+                "always staged by the pipeline and are unaffected by this "
+                "selection."
             ),
         )
         omni_config_group.add_argument(

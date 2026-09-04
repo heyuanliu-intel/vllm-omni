@@ -60,16 +60,19 @@ Every family is gated the same way in the backend:
 - `text_encoder` left out: encoders are placed on the device and nothing else
   is done to them -- no block streaming and no host parking, *even if the
   pipeline declares an encoder block stack or declares the encoder on-demand*.
-- `vae` left out: VAEs are placed on the device, *even if the pipeline declares
-  the VAE on-demand and it exposes `offload_to_cpu()`*.
+- `vae` left out: VAEs are placed on the device. Discovered VAEs are made
+  resident either way, so this family does not change what the backend does to
+  them; it exists so that a selection can name every family explicitly.
 
 A family left out of the selection stays fully device-resident, and that is a
-contract on both sides. A pipeline that manages its own encoder or VAE
-residency must read the selection before it host-stages a component:
-otherwise the backend places an unselected component on the device and the
-pipeline pulls it back after every use, paying a host round trip for weights
-the operator asked to keep resident. `MiniMaxH3Pipeline._stages_component_family`
-is the reference implementation.
+contract on both sides. A pipeline that manages its own encoder residency must
+read the selection before it host-stages a component: otherwise the backend
+places an unselected component on the device and the pipeline pulls it back
+after every use, paying a host round trip for weights the operator asked to
+keep resident. `MiniMaxH3Pipeline._stages_component_family` is the reference
+implementation. Pipeline-staged VAEs are always staged by the pipeline: they
+are kept out of component discovery, so no backend places them and the
+selection has nothing to say about them.
 
 ## Model integration
 

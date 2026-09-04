@@ -608,6 +608,8 @@ def test_h3_offload_plan_does_not_stage_vaes_on_demand():
 
     plan = MiniMaxH3Pipeline._offload_plan
     assert plan.on_demand_component_paths == frozenset({"text_encoder"})
+
+
 # ---------------------------------------------------------------------------
 # Layer-wise component selection: the pipeline side of the contract.
 #
@@ -630,7 +632,7 @@ def _residency_pipeline(**od_kwargs):
     return pipeline
 
 
-def test_unselected_vae_family_is_not_staged():
+def test_unselected_vae_family_is_still_staged_by_the_pipeline():
     pipeline = _residency_pipeline(
         enable_layerwise_offload=True,
         layerwise_offload_components="dit,text_encoder",
@@ -638,22 +640,48 @@ def test_unselected_vae_family_is_not_staged():
     component = Mock()
 
     with pipeline._component_on_device(component, family="vae"):
-        pass
+        component.load_to_device.assert_called_once_with()
+        component.offload_to_cpu.assert_not_called()
 
-    assert pipeline._stages_component_family("vae") is False
-    component.load_to_device.assert_not_called()
-    component.offload_to_cpu.assert_not_called()
+    # The VAEs are not reported by component discovery, so no backend places
+    # them: dropping "vae" from the selection would leave nobody owning their
+    # residency rather than making them resident.
+    assert pipeline._stages_component_family("vae") is True
+    component.offload_to_cpu.assert_called_once_with()
 
 
-def test_unselected_vae_family_is_built_on_the_device():
+def test_unselected_vae_family_is_still_built_on_the_host():
     pipeline = _residency_pipeline(
         enable_layerwise_offload=True,
         layerwise_offload_components="dit,text_encoder",
     )
+    # A device that differs from the host, so the assertion can fail.
+    pipeline.device = torch.device("cuda")
 
-    # Constructing on the host would only buy a start-up host-to-device
-    # transfer for weights the backend then keeps resident.
-    assert pipeline._vae_load_device() == pipeline.device
+    # Staged by the pipeline either way, so the weights are materialized on the
+    # host and moved in only for the encode and decode windows.
+    assert pipeline._vae_load_device() == torch.device("cpu")
+
+
+def test_decode_stages_both_vaes_when_the_selection_omits_vae():
+    # --layerwise-offload-components dit,text_encoder: both pipeline-staged VAEs
+    # must still be loaded for the decode window and released afterwards.
+    pipeline = _residency_pipeline(
+        enable_layerwise_offload=True,
+        layerwise_offload_components="dit,text_encoder",
+    )
+    pipeline.video_vae = Mock()
+    pipeline.video_vae.decode_latent.return_value = torch.ones(1, 3, 2, 8, 8)
+    pipeline.audio_vae = Mock()
+    pipeline.audio_vae.decode_latent.return_value = torch.ones(1, 4)
+
+    video, audio = pipeline.decode(torch.ones(1, 4, 2, 2, 2), torch.ones(1, 2), height=8, width=8)
+
+    assert video.shape == (1, 3, 2, 8, 8)
+    assert audio.shape == (1, 4)
+    for vae in (pipeline.video_vae, pipeline.audio_vae):
+        vae.load_to_device.assert_called_once_with()
+        vae.offload_to_cpu.assert_called_once_with()
 
 
 def test_default_selection_still_stages_every_family():

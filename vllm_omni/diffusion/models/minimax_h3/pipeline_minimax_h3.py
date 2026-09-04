@@ -1578,10 +1578,9 @@ class MiniMaxH3Pipeline(
     def _vae_load_device(self) -> torch.device:
         """Where the VAE weights are materialized at construction.
 
-        Building them on the host only pays off when this pipeline is the side
-        that stages them. When ``vae`` is left out of the selection the backend
-        places them on the device, and constructing on the host would only add
-        a start-up host-to-device transfer of weights that then stay resident.
+        This pipeline stages its own VAEs whenever layer-wise offloading is
+        active, so the weights are built in host memory and moved in only for
+        the encode and decode windows.
         """
 
         return torch.device("cpu") if self._stages_component_family("vae") else self.device
@@ -1589,12 +1588,23 @@ class MiniMaxH3Pipeline(
     def _stages_component_family(self, family: str) -> bool:
         """Whether this pipeline host-stages ``family`` between uses.
 
-        Distributed layer-wise offload stages every family it manages. Plain
-        layer-wise offload stages only the families named by
-        ``--layerwise-offload-components``: a family left out stays fully
-        device-resident, which is the contract the backend publishes as
-        ``OffloadConfig.layerwise_components``. Staging an unselected family
-        here would undo that placement and pay a host round trip per use.
+        Distributed layer-wise offload shards every component it manages, so it
+        stages every family here as well.
+
+        Under plain layer-wise offload, ``--layerwise-offload-components`` names
+        the families the backend may place, and a family left out stays fully
+        device-resident. A pipeline that stages such a family itself has to read
+        the same selection, otherwise it drags an unselected component back to
+        the host after every use. That applies to ``text_encoder``, which
+        component discovery reports.
+
+        It does not apply to the VAEs. They are deliberately kept out of
+        component discovery (see ``_vae_modules``), so no backend ever places
+        them and no backend is affected by whether ``vae`` is selected. If the
+        pipeline also stopped staging them, the VAEs would simply stay wherever
+        they were loaded with no component owning their residency, which is the
+        opposite of what an operator asks for by enabling layer-wise offload.
+        Pipeline-staged VAEs are therefore always staged by the pipeline.
         """
 
         od_config = getattr(self, "od_config", None)
@@ -1602,6 +1612,8 @@ class MiniMaxH3Pipeline(
             return True
         if not getattr(od_config, "enable_layerwise_offload", False):
             return False
+        if family == "vae":
+            return True
         return family in od_config.layerwise_component_selection()
 
     def enable_omni_model_cpu_offload(
